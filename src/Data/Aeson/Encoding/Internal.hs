@@ -1,6 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE EmptyDataDecls #-}
-{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 
@@ -16,6 +14,7 @@ module Data.Aeson.Encoding.Internal
     , pairs
     , pair
     , pairStr
+    , unsafePairSBS
     , pair'
     -- * Predicates
     , nullEncoding
@@ -26,8 +25,10 @@ module Data.Aeson.Encoding.Internal
     , wrapArray
     , null_
     , bool
+    , key
     , text
     , lazyText
+    , shortText
     , string
     , list
     , dict
@@ -59,23 +60,22 @@ module Data.Aeson.Encoding.Internal
     , comma, colon, openBracket, closeBracket, openCurly, closeCurly
     ) where
 
-import Prelude.Compat
+import Data.Aeson.Internal.Prelude hiding (empty)
 
 import Numeric (showFFloat)
 import Data.Aeson.Types.Internal (Value)
 import Data.ByteString.Builder (Builder, char7, toLazyByteString)
-import Data.Int
-import Data.Scientific (Scientific)
-import Data.Text (Text)
-import Data.Time (Day, LocalTime, TimeOfDay, UTCTime, ZonedTime)
+import Data.ByteString.Short (ShortByteString)
+import qualified Data.Aeson.Key as Key
+import Data.Time (Day, LocalTime, TimeOfDay, ZonedTime)
 import Data.Time.Calendar.Month.Compat (Month)
 import Data.Time.Calendar.Quarter.Compat (Quarter)
-import Data.Typeable (Typeable)
-import Data.Word
 import qualified Data.Aeson.Encoding.Builder as EB
 import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.Text.Lazy as LT
+import qualified Data.Text.Short as ST
+import Data.Aeson.Key (Key)
 
 -- | An encoding of a JSON value.
 --
@@ -117,6 +117,10 @@ instance Ord (Encoding' a) where
     compare (Encoding a) (Encoding b) =
       compare (toLazyByteString a) (toLazyByteString b)
 
+-- | @since 2.2.0.0
+instance IsString (Encoding' a) where
+  fromString = string
+
 -- | A series of values that, when encoded, should be separated by
 -- commas. Since 0.11.0.0, the '.=' operator is overloaded to create
 -- either @(Text, Value)@ or 'Series'. You can use Series when
@@ -128,21 +132,35 @@ data Series = Empty
             | Value (Encoding' Series)
             deriving (Typeable)
 
-pair :: Text -> Encoding -> Series
-pair name val = pair' (text name) val
+pair :: Key -> Encoding -> Series
+pair name val = pair' (key name) val
 {-# INLINE pair #-}
 
 pairStr :: String -> Encoding -> Series
 pairStr name val = pair' (string name) val
 {-# INLINE pairStr #-}
 
-pair' :: Encoding' Text -> Encoding -> Series
+pair' :: Encoding' Key -> Encoding -> Series
 pair' name val = Value $ retagEncoding $ retagEncoding name >< colon >< val
 
+-- | A variant of a 'pair' where key is already encoded
+-- including the quotes and colon.
+--
+-- @
+-- 'pair' "foo" v = 'unsafePair' "\\"foo\\":" v
+-- @
+--
+-- @since 2.0.3.0
+--
+unsafePairSBS :: ShortByteString -> Encoding -> Series
+unsafePairSBS k v = Value $ retagEncoding $ Encoding (B.shortByteString k) >< v
+{-# INLINE unsafePairSBS #-}
+
 instance Semigroup Series where
-    Empty   <> a       = a
-    a       <> Empty   = a
-    Value a <> Value b = Value (a >< comma >< b)
+    Empty   <> a = a
+    Value a <> b = Value $ a >< case b of
+        Empty   -> empty
+        Value x -> comma >< x
 
 instance Monoid Series where
     mempty  = Empty
@@ -185,7 +203,7 @@ list to' (x:xs) = openBracket >< to' x >< commas xs >< closeBracket
 
 -- | Encode as JSON object
 dict
-    :: (k -> Encoding' Text)                     -- ^ key encoding
+    :: (k -> Encoding' Key)                           -- ^ key encoding
     -> (v -> Encoding)                                -- ^ value encoding
     -> (forall a. (k -> v -> a -> a) -> a -> m -> a)  -- ^ @foldrWithKey@ - indexed fold
     -> m                                              -- ^ container
@@ -227,6 +245,9 @@ tuple :: Encoding' InArray -> Encoding
 tuple b = retagEncoding $ openBracket >< b >< closeBracket
 {-# INLINE tuple #-}
 
+key :: Key -> Encoding' a
+key = text . Key.toText
+
 text :: Text -> Encoding' a
 text = Encoding . EB.text
 
@@ -234,6 +255,14 @@ lazyText :: LT.Text -> Encoding' a
 lazyText t = Encoding $
     B.char7 '"' <>
     LT.foldrChunks (\x xs -> EB.unquoted x <> xs) (B.char7 '"') t
+
+-- | @since 2.0.2.0
+shortText :: ST.ShortText -> Encoding' a
+shortText t = Encoding $
+    B.char7 '"' <>
+    -- TODO: if we can determine whether all characters are >=0x20 && <0x80
+    -- we could use underlying ShortByteString directly.
+    EB.unquoted (ST.toText t) <> B.char7 '"'
 
 string :: String -> Encoding' a
 string = Encoding . EB.string
@@ -290,6 +319,20 @@ integer = Encoding . B.integerDec
 float :: Float -> Encoding
 float = realFloatToEncoding $ Encoding . realDec
 
+-- |
+--
+-- >>> double 42
+-- "42.0"
+--
+-- >>> double (0/0)
+-- "null"
+--
+-- >>> double (1/0)
+-- "\"+inf\""
+--
+-- >>> double (-23/0)
+-- "\"-inf\""
+--
 double :: Double -> Encoding
 double = realFloatToEncoding $ Encoding . realDec
 
@@ -304,8 +347,9 @@ scientific = Encoding . EB.scientific
 
 realFloatToEncoding :: RealFloat a => (a -> Encoding) -> a -> Encoding
 realFloatToEncoding e d
-    | isNaN d || isInfinite d = null_
-    | otherwise               = e d
+    | isNaN d      = null_
+    | isInfinite d = if d > 0 then Encoding "\"+inf\"" else Encoding "\"-inf\""
+    | otherwise    = e d
 {-# INLINE realFloatToEncoding #-}
 
 -------------------------------------------------------------------------------
@@ -346,10 +390,28 @@ integerText :: Integer -> Encoding' a
 integerText = Encoding . EB.quote . B.integerDec
 
 floatText :: Float -> Encoding' a
-floatText = Encoding . EB.quote . B.floatDec
+floatText d
+    | isInfinite d = if d > 0 then Encoding "\"+inf\"" else Encoding "\"-inf\""
+    | otherwise = Encoding . EB.quote . B.floatDec $ d
 
+-- |
+--
+-- >>> doubleText 42
+-- "\"42.0\""
+--
+-- >>> doubleText (0/0)
+-- "\"NaN\""
+--
+-- >>> doubleText (1/0)
+-- "\"+inf\""
+--
+-- >>> doubleText (-23/0)
+-- "\"-inf\""
+--
 doubleText :: Double -> Encoding' a
-doubleText = Encoding . EB.quote . B.doubleDec
+doubleText d
+    | isInfinite d = if d > 0 then Encoding "\"+inf\"" else Encoding "\"-inf\""
+    | otherwise = Encoding . EB.quote . B.doubleDec $ d
 
 scientificText :: Scientific -> Encoding' a
 scientificText = Encoding . EB.quote . EB.scientific

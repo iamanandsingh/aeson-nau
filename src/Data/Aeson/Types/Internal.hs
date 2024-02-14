@@ -2,18 +2,10 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE RecordWildCards #-}
-#if __GLASGOW_HASKELL__ >= 800
--- a) THQ works on cross-compilers and unregisterised GHCs
--- b) may make compilation faster as no dynamic loading is ever needed (not sure about this)
--- c) removes one hindrance to have code inferred as SafeHaskell safe
 {-# LANGUAGE TemplateHaskellQuotes #-}
-#else
-{-# LANGUAGE TemplateHaskell #-}
-#endif
+{-# LANGUAGE RecordWildCards #-}
 
 -- |
 -- Module:      Data.Aeson.Types.Internal
@@ -30,6 +22,7 @@ module Data.Aeson.Types.Internal
     (
     -- * Core JSON types
       Value(..)
+    , Key
     , Array
     , emptyArray, isEmptyArray
     , Pair
@@ -45,6 +38,7 @@ module Data.Aeson.Types.Internal
     , ErrorResp(..)
     , ErrorType(..)
     , iparse
+    , iparseEither
     , parse
     , parseEither
     , parseMaybe
@@ -74,6 +68,7 @@ module Data.Aeson.Types.Internal
         , constructorTagModifier
         , allNullaryToStringTag
         , omitNothingFields
+        , allowOmittedFields
         , sumEncoding
         , unwrapUnaryRecords
         , tagSingleConstructors
@@ -90,42 +85,40 @@ module Data.Aeson.Types.Internal
     , camelTo
     , camelTo2
 
+    -- * Aeson Exception
+    , AesonException (..)
+
     -- * Other types
     , DotNetTime(..)
     ) where
 
-import Prelude.Compat
+import Data.Aeson.Internal.Prelude
 
-import Control.Applicative (Alternative(..))
-import Control.Arrow (first)
 import Control.DeepSeq (NFData(..))
+import Control.Exception (Exception (..))
 import Control.Monad (MonadPlus(..), ap)
 import Data.Char (isLower, isUpper, toLower, isAlpha, isAlphaNum)
-import Data.Data (Data)
-import Data.Foldable (foldl')
-import Data.HashMap.Strict (HashMap)
+import Data.Aeson.Key (Key)
 import Data.Hashable (Hashable(..))
-import Data.List (intercalate, sortBy)
-import Data.Ord (comparing)
-import Data.Scientific (Scientific)
-import Data.String (IsString(..))
-import Data.Text (Text, pack, unpack)
-import Data.Time (UTCTime)
+import Data.List (intercalate)
+import Data.Text (pack, unpack)
 import Data.Time.Format (FormatTime)
-import Data.Typeable (Typeable)
-import Data.Vector (Vector)
-import GHC.Generics (Generic)
+import Data.Aeson.KeyMap (KeyMap)
 import qualified Control.Monad as Monad
 import qualified Control.Monad.Fail as Fail
-import qualified Data.HashMap.Strict as H
-import qualified Data.Scientific as S
 import qualified Data.Vector as V
 import qualified Language.Haskell.TH.Syntax as TH
 import Text.Read (readMaybe)
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Scientific as Sci
+import qualified Data.Text as T
+import qualified Test.QuickCheck as QC
+import Witherable (ordNub)
 
 -- | Elements of a JSON path used to describe the location of an
 -- error.
-data JSONPathElement = Key Text
+data JSONPathElement = Key Key
                        -- ^ JSON path element of a key into an object,
                        -- \"object.key\".
                      | Index {-# UNPACK #-} !Int
@@ -319,6 +312,19 @@ instance Monad.Monad Parser where
     {-# INLINE fail #-}
 #endif
 
+-- |
+--
+-- @since 2.1.0.0
+instance MonadFix Parser where
+    mfix f = Parser $ \path kf ks -> let x = runParser (f (fromISuccess x)) path IError ISuccess in
+        case x of
+            IError p e -> kf p e
+            ISuccess y -> ks y
+      where
+        fromISuccess :: IResult a -> a
+        fromISuccess (ISuccess x)      = x
+        fromISuccess (IError path msg) = error $ "mfix @Aeson.Parser: " ++ formatPath path ++ ": " ++ msg
+
 instance Fail.MonadFail Parser where
     fail msg = Parser $ \path kf _ks -> kf (reverse path) msg
     {-# INLINE fail #-}
@@ -368,7 +374,7 @@ apP d e = do
 {-# INLINE apP #-}
 
 -- | A JSON \"object\" (key\/value map).
-type Object = HashMap Text Value
+type Object = KeyMap Value
 
 -- | A JSON \"array\" (sequence).
 type Array = Vector Value
@@ -402,8 +408,97 @@ instance Show Value where
         $ showString "Array " . showsPrec 11 xs
     showsPrec d (Object xs) = showParen (d > 10)
         $ showString "Object (fromList "
-        . showsPrec 11 (sortBy (comparing fst) (H.toList xs))
+        . showsPrec 11 (KM.toAscList xs)
         . showChar ')'
+
+-- | @since 2.0.3.0
+instance QC.Arbitrary Value where
+    arbitrary = QC.sized arbValue
+
+    shrink = ordNub . go where
+        go Null       = []
+        go (Bool b)   = Null : map Bool (QC.shrink b)
+        go (String x) = Null : map (String . T.pack) (QC.shrink (T.unpack x))
+        go (Number x) = Null : map Number (shrScientific x)
+        go (Array x)  = Null : V.toList x ++ map (Array . V.fromList) (QC.liftShrink go (V.toList x))
+        go (Object x) = Null : KM.elems x ++ map (Object . KM.fromList) (QC.liftShrink (QC.liftShrink go) (KM.toList x))
+
+-- | @since 2.0.3.0
+instance QC.CoArbitrary Value where
+    coarbitrary Null       = QC.variant (0 :: Int)
+    coarbitrary (Bool b)   = QC.variant (1 :: Int) . QC.coarbitrary b
+    coarbitrary (String x) = QC.variant (2 :: Int) . QC.coarbitrary (T.unpack x)
+    coarbitrary (Number x) = QC.variant (3 :: Int) . QC.coarbitrary (Sci.coefficient x) . QC.coarbitrary (Sci.base10Exponent x)
+    coarbitrary (Array x)  = QC.variant (4 :: Int) . QC.coarbitrary (V.toList x)
+    coarbitrary (Object x) = QC.variant (5 :: Int) . QC.coarbitrary (KM.toList x)
+
+-- | @since 2.0.3.0
+instance QC.Function Value where
+    function = QC.functionMap fwd bwd where
+        fwd :: Value -> RepValue
+        fwd Null       = Left Nothing
+        fwd (Bool b)   = Left (Just b)
+        fwd (String x) = Right (Left (Left (T.unpack x)))
+        fwd (Number x) = Right (Left (Right (Sci.coefficient x, Sci.base10Exponent x)))
+        fwd (Array x)  = Right (Right (Left (V.toList x)))
+        fwd (Object x) = Right (Right (Right (KM.toList x)))
+
+        bwd :: RepValue -> Value
+        bwd (Left Nothing)                = Null
+        bwd (Left (Just b))               = Bool b
+        bwd (Right (Left (Left x)))       = String (T.pack x)
+        bwd (Right (Left (Right (x, y)))) = Number (Sci.scientific x y)
+        bwd (Right (Right (Left x)))      = Array (V.fromList x)
+        bwd (Right (Right (Right x)))     = Object (KM.fromList x)
+
+-- Used to implement QC.Function Value instance
+type RepValue
+    = Either (Maybe Bool) (Either (Either String (Integer, Int)) (Either [Value] [(Key, Value)]))
+
+arbValue :: Int -> QC.Gen Value
+arbValue n
+    | n <= 1 = QC.oneof
+        [ pure Null
+        , Bool <$> QC.arbitrary
+        , String <$> arbText
+        , Number <$> arbScientific
+        , pure emptyObject
+        , pure emptyArray
+        ]
+
+    | otherwise = QC.oneof
+        [ Object <$> arbObject n
+        , Array <$> arbArray  n
+        ]
+
+arbText :: QC.Gen Text
+arbText = T.pack <$> QC.arbitrary
+
+arbScientific :: QC.Gen Scientific
+arbScientific = Sci.scientific <$> QC.arbitrary <*> QC.arbitrary
+
+shrScientific :: Scientific -> [Scientific]
+shrScientific s = map (uncurry Sci.scientific) $
+    QC.shrink (Sci.coefficient s, Sci.base10Exponent s) 
+
+arbObject :: Int -> QC.Gen Object
+arbObject n = do
+    p <- arbPartition (n - 1)
+    KM.fromList <$> traverse (\m -> (,) <$> QC.arbitrary <*> arbValue m) p
+
+arbArray :: Int -> QC.Gen Array
+arbArray n = do
+    p <- arbPartition (n - 1)
+    V.fromList <$> traverse arbValue p
+
+arbPartition :: Int -> QC.Gen [Int]
+arbPartition k = case compare k 1 of
+    LT -> pure []
+    EQ -> pure [1]
+    GT -> do
+        first <- QC.chooseInt (1, k)
+        rest <- arbPartition $ k - first
+        QC.shuffle (first : rest)
 
 -- |
 --
@@ -453,20 +548,17 @@ hashValue s Null         = s `hashWithSalt` (5::Int)
 instance Hashable Value where
     hashWithSalt = hashValue
 
--- @since 0.11.0.0
+-- | @since 0.11.0.0
 instance TH.Lift Value where
-    lift Null = [| Null |]
-    lift (Bool b) = [| Bool b |]
-    lift (Number n) = [| Number (S.scientific c e) |]
-      where
-        c = S.coefficient n
-        e = S.base10Exponent n
+    lift Null       = [| Null |]
+    lift (Bool b)   = [| Bool b |]
+    lift (Number n) = [| Number n |]
     lift (String t) = [| String (pack s) |]
       where s = unpack t
-    lift (Array a) = [| Array (V.fromList a') |]
+    lift (Array a)  = [| Array (V.fromList a') |]
       where a' = V.toList a
-    lift (Object o) = [| Object (H.fromList . map (first pack) $ o') |]
-      where o' = map (first unpack) . H.toList $ o
+    lift (Object o) = [| Object o |]
+
 #if MIN_VERSION_template_haskell(2,17,0)
     liftTyped = TH.unsafeCodeCoerce . TH.lift
 #elif MIN_VERSION_template_haskell(2,16,0)
@@ -485,7 +577,7 @@ isEmptyArray _ = False
 
 -- | The empty object.
 emptyObject :: Value
-emptyObject = Object H.empty
+emptyObject = Object KM.empty
 
 -- | Run a 'Parser'.
 parse :: (a -> Parser b) -> a -> Result b
@@ -509,6 +601,14 @@ parseEither m v = runParser (m v) [] onError Right
   where onError path msg = Left (addFieldNameToErrorResp path msg)
 {-# INLINE parseEither #-}
 
+-- | Run a 'Parser' with an 'Either' result type.
+-- If the parse fails, the 'Left' payload will contain an error message and a json path to failed element.
+--
+-- @since 2.1.0.0
+iparseEither :: (a -> Parser b) -> a -> Either (JSONPath, String) b
+iparseEither m v = runParser (m v) [] (\path msg -> Left (path, msg)) Right
+{-# INLINE iparseEither #-}
+
 -- | Annotate an error message with a
 -- <http://goessner.net/articles/JsonPath/ JSONPath> error location.
 formatError :: JSONPath -> String -> String
@@ -529,11 +629,11 @@ formatRelativePath path = format "" path
     format pfx (Index idx:parts) = format (pfx ++ "[" ++ show idx ++ "]") parts
     format pfx (Key key:parts)   = format (pfx ++ formatKey key) parts
 
-    formatKey :: Text -> String
+    formatKey :: Key -> String
     formatKey key
        | isIdentifierKey strKey = "." ++ strKey
        | otherwise              = "['" ++ escapeKey strKey ++ "']"
-      where strKey = unpack key
+      where strKey = Key.toString key
 
     isIdentifierKey :: String -> Bool
     isIdentifierKey []     = False
@@ -554,7 +654,7 @@ getFieldName path =
         format :: JSONPath -> Maybe String
         format []                = Nothing
         format (Index idx:parts) = format parts
-        format (Key key:_)   = Just $ formatKey key
+        format (Key key:_)   = Just $ formatKey $ Key.toText key
 
         formatKey :: Text -> String
         formatKey key
@@ -613,12 +713,12 @@ missingFieldErr :: Maybe String -> String -> String
 missingFieldErr objectType field = show $
             defaultErrorObject {errorType = MISSING_FIELD, errField = Just field, objectType = objectType}
 -- | A key\/value pair for an 'Object'.
-type Pair = (Text, Value)
+type Pair = (Key, Value)
 
 -- | Create a 'Value' from a list of name\/value 'Pair's.  If duplicate
--- keys arise, earlier keys and their associated values win.
+-- keys arise, later keys and their associated values win.
 object :: [Pair] -> Value
-object = Object . H.fromList
+object = Object . KM.fromList
 {-# INLINE object #-}
 
 -- | Add JSON Path context to a parser
@@ -701,50 +801,16 @@ data Options = Options
       -- omitted from the resulting object. If 'False', the resulting
       -- object will include those fields mapping to @null@.
       --
+      -- In @aeson-2.2@ this flag is generalised to omit all values with @'Data.Aeson.Types.omitField' x = True@.
+      -- If 'False', the resulting object will include those fields encoded as specified. 
+      --
       -- Note that this /does not/ affect parsing: 'Maybe' fields are
-      -- optional regardless of the value of 'omitNothingFields', subject
-      -- to the note below.
-      --
-      -- === Note
-      --
-      -- Setting 'omitNothingFields' to 'True' only affects fields which are of
-      -- type 'Maybe' /uniformly/ in the 'ToJSON' instance.
-      -- In particular, if the type of a field is declared as a type variable, it
-      -- will not be omitted from the JSON object, unless the field is
-      -- specialized upfront in the instance.
-      --
-      -- The same holds for 'Maybe' fields being optional in the 'FromJSON' instance.
-      --
-      -- ==== __Example__
-      --
-      -- The generic instance for the following type @Fruit@ depends on whether
-      -- the instance head is @Fruit a@ or @Fruit (Maybe a)@.
-      --
-      -- @
-      -- data Fruit a = Fruit
-      --   { apples :: a  -- A field whose type is a type variable.
-      --   , oranges :: 'Maybe' Int
-      --   } deriving 'Generic'
-      --
-      -- -- apples required, oranges optional
-      -- -- Even if 'Data.Aeson.fromJSON' is then specialized to (Fruit ('Maybe' a)).
-      -- instance 'Data.Aeson.FromJSON' a => 'Data.Aeson.FromJSON' (Fruit a)
-      --
-      -- -- apples optional, oranges optional
-      -- -- In this instance, the field apples is uniformly of type ('Maybe' a).
-      -- instance 'Data.Aeson.FromJSON' a => 'Data.Aeson.FromJSON' (Fruit ('Maybe' a))
-      --
-      -- options :: 'Options'
-      -- options = 'defaultOptions' { 'omitNothingFields' = 'True' }
-      --
-      -- -- apples always present in the output, oranges is omitted if 'Nothing'
-      -- instance 'Data.Aeson.ToJSON' a => 'Data.Aeson.ToJSON' (Fruit a) where
-      --   'Data.Aeson.toJSON' = 'Data.Aeson.genericToJSON' options
-      --
-      -- -- both apples and oranges are omitted if 'Nothing'
-      -- instance 'Data.Aeson.ToJSON' a => 'Data.Aeson.ToJSON' (Fruit ('Maybe' a)) where
-      --   'Data.Aeson.toJSON' = 'Data.Aeson.genericToJSON' options
-      -- @
+      -- optional regardless of the value of 'omitNothingFields'.
+      -- 'allowOmittedFieds' controls parsing behavior.
+    , allowOmittedFields :: Bool
+      -- ^ If 'True', missing fields of a record will be filled
+      -- with 'omittedField' values (if they are 'Just').
+      -- If 'False', all fields will required to present in the record object.
     , sumEncoding :: SumEncoding
       -- ^ Specifies how to encode constructors of a sum datatype.
     , unwrapUnaryRecords :: Bool
@@ -760,13 +826,14 @@ data Options = Options
     }
 
 instance Show Options where
-  show (Options f c a o s u t r) =
+  show (Options f c a o q s u t r) =
        "Options {"
     ++ intercalate ", "
       [ "fieldLabelModifier =~ " ++ show (f "exampleField")
       , "constructorTagModifier =~ " ++ show (c "ExampleConstructor")
       , "allNullaryToStringTag = " ++ show a
       , "omitNothingFields = " ++ show o
+      , "allowOmittedFields = " ++ show q
       , "sumEncoding = " ++ show s
       , "unwrapUnaryRecords = " ++ show u
       , "tagSingleConstructors = " ++ show t
@@ -849,6 +916,7 @@ data JSONKeyOptions = JSONKeyOptions
 -- , 'constructorTagModifier'  = id
 -- , 'allNullaryToStringTag'   = True
 -- , 'omitNothingFields'       = False
+-- , 'allowOmittedFields'      = True
 -- , 'sumEncoding'             = 'defaultTaggedObject'
 -- , 'unwrapUnaryRecords'      = False
 -- , 'tagSingleConstructors'   = False
@@ -861,6 +929,7 @@ defaultOptions = Options
                  , constructorTagModifier  = id
                  , allNullaryToStringTag   = True
                  , omitNothingFields       = False
+                 , allowOmittedFields      = True
                  , sumEncoding             = defaultTaggedObject
                  , unwrapUnaryRecords      = False
                  , tagSingleConstructors   = False
@@ -915,8 +984,8 @@ camelTo c = lastWasCap True
 
 -- | Better version of 'camelTo'. Example where it works better:
 --
---   > camelTo '_' 'CamelAPICase' == "camel_apicase"
---   > camelTo2 '_' 'CamelAPICase' == "camel_api_case"
+--   > camelTo '_' "CamelAPICase" == "camel_apicase"
+--   > camelTo2 '_' "CamelAPICase" == "camel_api_case"
 camelTo2 :: Char -> String -> String
 camelTo2 c = map toLower . go2 . go1
     where go1 "" = ""
@@ -925,3 +994,16 @@ camelTo2 c = map toLower . go2 . go1
           go2 "" = ""
           go2 (l:u:xs) | isLower l && isUpper u = l : c : u : go2 xs
           go2 (x:xs) = x : go2 xs
+
+-------------------------------------------------------------------------------
+-- AesonException
+-------------------------------------------------------------------------------
+
+-- | Exception thrown by 'throwDecode' and variants.
+--
+-- @since 2.1.2.0
+newtype AesonException = AesonException String
+  deriving (Show)
+
+instance Exception AesonException where
+    displayException (AesonException str) = "aeson: " ++ str

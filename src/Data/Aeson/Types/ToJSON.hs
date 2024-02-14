@@ -1,24 +1,19 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE UndecidableInstances #-}
-
-#include "overlapping-compat.h"
-#include "incoherent-compat.h"
-
--- TODO: Drop this when we remove support for Data.Attoparsec.Number
-{-# OPTIONS_GHC -fno-warn-deprecations #-}
 
 module Data.Aeson.Types.ToJSON
     (
@@ -28,9 +23,11 @@ module Data.Aeson.Types.ToJSON
     , ToJSON1(..)
     , toJSON1
     , toEncoding1
+    , omitField1
     , ToJSON2(..)
     , toJSON2
     , toEncoding2
+    , omitField2
     -- * Generic JSON classes
     , GToJSON'(..)
     , ToArgs(..)
@@ -42,6 +39,7 @@ module Data.Aeson.Types.ToJSON
     , ToJSONKey(..)
     , ToJSONKeyFunction(..)
     , toJSONKeyText
+    , toJSONKeyKey
     , contramapToJSONKeyFunction
 
     , GToJSONKey()
@@ -49,6 +47,7 @@ module Data.Aeson.Types.ToJSON
 
     -- * Object key-value pairs
     , KeyValue(..)
+    , KeyValueOmit(..)
     , KeyValuePair(..)
     , FromPairs(..)
     -- * Functions needed for documentation
@@ -57,16 +56,16 @@ module Data.Aeson.Types.ToJSON
     , listValue
     ) where
 
-import Prelude.Compat
+import Data.Aeson.Internal.Prelude
 
-import Control.Applicative (Const(..))
 import Control.Monad.ST (ST)
 import Data.Aeson.Encoding (Encoding, Encoding', Series, dict, emptyArray_)
 import Data.Aeson.Encoding.Internal ((>*<))
-import Data.Aeson.Internal.Functions (mapHashKeyVal, mapKeyVal)
+import Data.Aeson.Internal.Functions (mapKeyVal, mapKeyValO)
 import Data.Aeson.Types.Generic (AllNullary, False, IsRecord, One, ProductSize, Tagged2(..), True, Zero, productSize)
 import Data.Aeson.Types.Internal
-import Data.Attoparsec.Number (Number(..))
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
 import Data.Bits (unsafeShiftR)
 import Data.DList (DList)
 import Data.Fixed (Fixed, HasResolution, Nano)
@@ -77,37 +76,30 @@ import Data.Functor.Identity (Identity(..))
 import Data.Functor.Product (Product(..))
 import Data.Functor.Sum (Sum(..))
 import Data.Functor.These (These1 (..))
-import Data.Int (Int16, Int32, Int64, Int8)
 import Data.List (intersperse)
 import Data.List.NonEmpty (NonEmpty(..))
-import Data.Proxy (Proxy(..))
+import Data.Maybe (isNothing)
+import Data.Ord (Down (..))
 import Data.Ratio (Ratio, denominator, numerator)
-import Data.Scientific (Scientific)
 import Data.Tagged (Tagged(..))
-import Data.Text (Text, pack)
 import Data.These (These (..))
-import Data.Time (Day, DiffTime, LocalTime, NominalDiffTime, TimeOfDay, UTCTime, ZonedTime)
+import Data.Time (Day, DiffTime, LocalTime, NominalDiffTime, TimeOfDay, ZonedTime)
 import Data.Time.Calendar.Month.Compat (Month)
 import Data.Time.Calendar.Quarter.Compat (Quarter, QuarterOfYear (..))
 import Data.Time.Calendar.Compat (CalendarDiffDays (..), DayOfWeek (..))
 import Data.Time.LocalTime.Compat (CalendarDiffTime (..))
 import Data.Time.Clock.System.Compat (SystemTime (..))
 import Data.Time.Format.Compat (FormatTime, formatTime, defaultTimeLocale)
-import Data.Vector (Vector)
+import Data.Tuple.Solo (Solo (..), getSolo)
 import Data.Version (Version, showVersion)
-import Data.Void (Void, absurd)
-import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.Storable (Storable)
 import Foreign.C.Types (CTime (..))
 import GHC.Generics
-import Numeric.Natural (Natural)
 import qualified Data.Aeson.Encoding as E
-import qualified Data.Aeson.Encoding.Internal as E (InArray, comma, econcat, retagEncoding)
+import qualified Data.Aeson.Encoding.Internal as E (InArray, comma, econcat, retagEncoding, key)
 import qualified Data.ByteString.Lazy as L
 import qualified Data.DList as DList
-#if MIN_VERSION_dlist(1,0,0) && __GLASGOW_HASKELL__ >=800
 import qualified Data.DList.DNonEmpty as DNE
-#endif
 import qualified Data.Fix as F
 import qualified Data.HashMap.Strict as H
 import qualified Data.HashSet as HashSet
@@ -124,6 +116,7 @@ import qualified Data.Strict as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.Lazy as LT
+import qualified Data.Text.Short as ST
 import qualified Data.Tree as Tree
 import qualified Data.UUID.Types as UUID
 import qualified Data.Vector as V
@@ -132,6 +125,7 @@ import qualified Data.Vector.Mutable as VM
 import qualified Data.Vector.Primitive as VP
 import qualified Data.Vector.Storable as VS
 import qualified Data.Vector.Unboxed as VU
+import qualified Network.URI as URI
 
 import qualified Data.Aeson.Encoding.Builder as EB
 import qualified Data.ByteString.Builder as B
@@ -143,12 +137,13 @@ import qualified Data.Primitive.Types as PM
 import qualified Data.Primitive.PrimArray as PM
 
 toJSONPair :: (a -> Value) -> (b -> Value) -> (a, b) -> Value
-toJSONPair a b = liftToJSON2 a (listValue a) b (listValue b)
+toJSONPair a b = liftToJSON2 (const False) a (listValue a) (const False) b (listValue b)
 
 realFloatToJSON :: RealFloat a => a -> Value
 realFloatToJSON d
-    | isNaN d || isInfinite d = Null
-    | otherwise = Number $ Scientific.fromFloatDigits d
+    | isNaN d      = Null
+    | isInfinite d = if d > 0 then "+inf" else "-inf"
+    | otherwise    = Number $ Scientific.fromFloatDigits d
 
 -------------------------------------------------------------------------------
 -- Generics
@@ -167,12 +162,12 @@ class GToJSON' enc arity f where
     -- and 'liftToEncoding' (if the @arity@ is 'One').
     gToJSON :: Options -> ToArgs enc arity a -> f a -> enc
 
--- | A 'ToArgs' value either stores nothing (for 'ToJSON') or it stores the two
+-- | A 'ToArgs' value either stores nothing (for 'ToJSON') or it stores the three
 -- function arguments that encode occurrences of the type parameter (for
 -- 'ToJSON1').
 data ToArgs res arity a where
     NoToArgs :: ToArgs res Zero a
-    To1Args  :: (a -> res) -> ([a] -> res) -> ToArgs res One a
+    To1Args  :: (a -> Bool) -> (a -> res) -> ([a] -> res) -> ToArgs res One a
 
 -- | A configurable generic JSON creator. This function applied to
 -- 'defaultOptions' is used as the default for 'toJSON' when the type
@@ -185,9 +180,9 @@ genericToJSON opts = gToJSON opts NoToArgs . from
 -- 'defaultOptions' is used as the default for 'liftToJSON' when the type
 -- is an instance of 'Generic1'.
 genericLiftToJSON :: (Generic1 f, GToJSON' Value One (Rep1 f))
-                  => Options -> (a -> Value) -> ([a] -> Value)
+                  => Options -> (a -> Bool) -> (a -> Value) -> ([a] -> Value)
                   -> f a -> Value
-genericLiftToJSON opts tj tjl = gToJSON opts (To1Args tj tjl) . from1
+genericLiftToJSON opts o tj tjl = gToJSON opts (To1Args o tj tjl) . from1
 
 -- | A configurable generic JSON encoder. This function applied to
 -- 'defaultOptions' is used as the default for 'toEncoding' when the type
@@ -200,9 +195,9 @@ genericToEncoding opts = gToJSON opts NoToArgs . from
 -- 'defaultOptions' is used as the default for 'liftToEncoding' when the type
 -- is an instance of 'Generic1'.
 genericLiftToEncoding :: (Generic1 f, GToJSON' Encoding One (Rep1 f))
-                      => Options -> (a -> Encoding) -> ([a] -> Encoding)
+                      => Options -> (a -> Bool) -> (a -> Encoding) -> ([a] -> Encoding)
                       -> f a -> Encoding
-genericLiftToEncoding opts te tel = gToJSON opts (To1Args te tel) . from1
+genericLiftToEncoding opts o te tel = gToJSON opts (To1Args o te tel) . from1
 
 -------------------------------------------------------------------------------
 -- Class
@@ -253,6 +248,12 @@ genericLiftToEncoding opts te tel = gToJSON opts (To1Args te tel) . from1
 --     'toEncoding' = 'genericToEncoding' 'defaultOptions'
 -- @
 --
+-- or more conveniently using the [DerivingVia extension](https://downloads.haskell.org/ghc/9.2.3/docs/html/users_guide/exts/deriving_via.html)
+--
+-- @
+-- deriving via 'Generically' Coord instance 'ToJSON' Coord
+-- @
+--
 -- If on the other hand you wish to customize the generic decoding, you have
 -- to implement both methods:
 --
@@ -269,7 +270,7 @@ genericLiftToEncoding opts te tel = gToJSON opts (To1Args te tel) . from1
 -- Previous versions of this library only had the 'toJSON' method. Adding
 -- 'toEncoding' had two reasons:
 --
--- 1. toEncoding is more efficient for the common case that the output of
+-- 1. 'toEncoding' is more efficient for the common case that the output of
 -- 'toJSON' is directly serialized to a @ByteString@.
 -- Further, expressing either method in terms of the other would be
 -- non-optimal.
@@ -308,7 +309,6 @@ class ToJSON a where
     -- instance 'ToJSON' Coord where
     --     'toEncoding' = 'genericToEncoding' 'defaultOptions'
     -- @
-
     toEncoding :: a -> Encoding
     toEncoding = E.value . toJSON
 
@@ -318,29 +318,79 @@ class ToJSON a where
     toEncodingList :: [a] -> Encoding
     toEncodingList = listEncoding toEncoding
 
+    -- | Defines when it is acceptable to omit a field of this type from a record.
+    -- Used by @('.?=')@ operator, and Generics and TH deriving
+    -- with @'omitNothingFields' = True@.
+    --
+    -- @since 2.2.0.0
+    omitField :: a -> Bool
+    omitField = const False
+
+-- | @since 2.1.0.0
+instance (Generic a, GToJSON' Value Zero (Rep a), GToJSON' Encoding Zero (Rep a)) => ToJSON (Generically a) where
+    toJSON     = coerce (genericToJSON     defaultOptions :: a -> Value)
+    toEncoding = coerce (genericToEncoding defaultOptions :: a -> Encoding)
+
 -------------------------------------------------------------------------------
 -- Object key-value pairs
 -------------------------------------------------------------------------------
 
 -- | A key-value pair for encoding a JSON object.
-class KeyValue kv where
-    (.=) :: ToJSON v => Text -> v -> kv
+class KeyValue e kv | kv -> e where
+
+    (.=) :: ToJSON v => Key -> v -> kv
     infixr 8 .=
 
-instance KeyValue Series where
-    name .= value = E.pair name (toEncoding value)
+    -- | @since 2.2.0.0
+    explicitToField :: (v -> e) -> Key -> v -> kv
+
+instance KeyValue Encoding Series where
+    (.=) = explicitToField toEncoding
     {-# INLINE (.=) #-}
 
-instance KeyValue Pair where
-    name .= value = (name, toJSON value)
+    explicitToField f name value = E.pair name (f value)
+    {-# INLINE explicitToField #-}
+
+instance (key ~ Key, value ~ Value) => KeyValue Value (key, value) where
+    (.=) = explicitToField toJSON
     {-# INLINE (.=) #-}
 
--- | Constructs a singleton 'H.HashMap'. For calling functions that
+    explicitToField f name value = (name, f value)
+    {-# INLINE explicitToField #-}
+
+-- | Constructs a singleton 'KM.KeyMap'. For calling functions that
 --   demand an 'Object' for constructing objects. To be used in
 --   conjunction with 'mconcat'. Prefer to use 'object' where possible.
-instance KeyValue Object where
-    name .= value = H.singleton name (toJSON value)
+instance value ~ Value => KeyValue Value (KM.KeyMap value) where
+    (.=) = explicitToField toJSON
     {-# INLINE (.=) #-}
+    
+    explicitToField f name value = KM.singleton name (f value)
+    {-# INLINE explicitToField #-}
+
+-- | An optional key-value pair for envoding to a JSON object
+--
+-- @since 2.2.0.0
+--
+class KeyValue e kv => KeyValueOmit e kv | kv -> e where
+    (.?=) :: ToJSON v => Key -> v -> kv
+    infixr 8 .?=
+
+    explicitToFieldOmit :: (v -> Bool) -> (v -> e) -> Key -> v -> kv
+
+instance KeyValueOmit Encoding Series where
+    name .?= value = if omitField value then mempty else name .= value
+    {-# INLINE (.?=) #-}
+
+    explicitToFieldOmit o f name value = if o value then mempty else explicitToField f name value
+    {-# INLINE explicitToFieldOmit #-}
+
+instance value ~ Value => KeyValueOmit Value (KM.KeyMap value) where
+    name .?= value = if omitField value then KM.empty else name .= value
+    {-# INLINE (.?=) #-}
+
+    explicitToFieldOmit o f name value = if o value then KM.empty else explicitToField f name value
+    {-# INLINE explicitToFieldOmit #-}
 
 -------------------------------------------------------------------------------
 --  Classes and types for map keys
@@ -477,7 +527,7 @@ class ToJSONKey a where
     toJSONKeyList = ToJSONKeyValue toJSON toEncoding
 
 data ToJSONKeyFunction a
-    = ToJSONKeyText !(a -> Text) !(a -> Encoding' Text)
+    = ToJSONKeyText !(a -> Key) !(a -> Encoding' Key)
       -- ^ key is encoded to string, produces object
     | ToJSONKeyValue !(a -> Value) !(a -> Encoding)
       -- ^ key is encoded to value, produces array
@@ -491,14 +541,21 @@ data ToJSONKeyFunction a
 --         myKeyToText = Text.pack . show -- or showt from text-show
 -- @
 toJSONKeyText :: (a -> Text) -> ToJSONKeyFunction a
-toJSONKeyText f = ToJSONKeyText f (E.text . f)
+toJSONKeyText f = toJSONKeyKey (Key.fromText . f)
+
+-- |
+--
+-- @since 2.0.0.0
+toJSONKeyKey :: (a -> Key) -> ToJSONKeyFunction a
+toJSONKeyKey f = ToJSONKeyText f (E.key . f)
 
 -- | TODO: should this be exported?
-toJSONKeyTextEnc :: (a -> Encoding' Text) -> ToJSONKeyFunction a
+toJSONKeyTextEnc :: (a -> Encoding' Key) -> ToJSONKeyFunction a
 toJSONKeyTextEnc e = ToJSONKeyText tot e
  where
     -- TODO: dropAround is also used in stringEncoding, which is unfortunate atm
-    tot = T.dropAround (== '"')
+    tot = Key.fromText
+        . T.dropAround (== '"')
         . T.decodeLatin1
         . L.toStrict
         . E.encodingToLazyByteString
@@ -531,13 +588,13 @@ contramapToJSONKeyFunction h x = case x of
 -- @
 genericToJSONKey :: (Generic a, GToJSONKey (Rep a))
            => JSONKeyOptions -> ToJSONKeyFunction a
-genericToJSONKey opts = toJSONKeyText (pack . keyModifier opts . getConName . from)
+genericToJSONKey opts = toJSONKeyKey (Key.fromString . keyModifier opts . getConName . from)
 
 class    GetConName f => GToJSONKey f
 instance GetConName f => GToJSONKey f
 
 -------------------------------------------------------------------------------
--- Lifings of FromJSON and ToJSON to unary and binary type constructors
+-- Liftings of FromJSON and ToJSON to unary and binary type constructors
 -------------------------------------------------------------------------------
 
 
@@ -586,34 +643,49 @@ instance GetConName f => GToJSONKey f
 --
 -- See also 'ToJSON'.
 class ToJSON1 f where
-    liftToJSON :: (a -> Value) -> ([a] -> Value) -> f a -> Value
+    liftToJSON :: (a -> Bool) -> (a -> Value) -> ([a] -> Value) -> f a -> Value
 
     default liftToJSON :: (Generic1 f, GToJSON' Value One (Rep1 f))
-                       => (a -> Value) -> ([a] -> Value) -> f a -> Value
+                       => (a -> Bool) -> (a -> Value) -> ([a] -> Value) -> f a -> Value
     liftToJSON = genericLiftToJSON defaultOptions
 
-    liftToJSONList :: (a -> Value) -> ([a] -> Value) -> [f a] -> Value
-    liftToJSONList f g = listValue (liftToJSON f g)
+    liftToJSONList :: (a -> Bool) -> (a -> Value) -> ([a] -> Value) -> [f a] -> Value
+    liftToJSONList o f g = listValue (liftToJSON o f g)
 
-    liftToEncoding :: (a -> Encoding) -> ([a] -> Encoding) -> f a -> Encoding
+    liftToEncoding :: (a -> Bool) -> (a -> Encoding) -> ([a] -> Encoding) -> f a -> Encoding
 
     default liftToEncoding :: (Generic1 f, GToJSON' Encoding One (Rep1 f))
-                           => (a -> Encoding) -> ([a] -> Encoding)
+                           => (a -> Bool) -> (a -> Encoding) -> ([a] -> Encoding)
                            -> f a -> Encoding
     liftToEncoding = genericLiftToEncoding defaultOptions
 
-    liftToEncodingList :: (a -> Encoding) -> ([a] -> Encoding) -> [f a] -> Encoding
-    liftToEncodingList f g = listEncoding (liftToEncoding f g)
+    liftToEncodingList :: (a -> Bool) -> (a -> Encoding) -> ([a] -> Encoding) -> [f a] -> Encoding
+    liftToEncodingList o f g = listEncoding (liftToEncoding o f g)
+
+    -- | @since 2.2.0.0
+    liftOmitField :: (a -> Bool) -> f a -> Bool
+    liftOmitField _ _ = False
+
+-- | @since 2.1.0.0
+instance (Generic1 f, GToJSON' Value One (Rep1 f), GToJSON' Encoding One (Rep1 f)) => ToJSON1 (Generically1 f) where
+    liftToJSON :: forall a. (a -> Bool) -> (a -> Value) -> ([a] -> Value) -> Generically1 f a -> Value
+    liftToJSON = coerce (genericLiftToJSON defaultOptions :: (a -> Bool) -> (a -> Value) -> ([a] -> Value) -> f a -> Value)
+
+    liftToEncoding :: forall a. (a -> Bool) -> (a -> Encoding) -> ([a] -> Encoding) -> Generically1 f a -> Encoding
+    liftToEncoding = coerce (genericLiftToEncoding defaultOptions :: (a -> Bool) -> (a -> Encoding) -> ([a] -> Encoding) -> f a -> Encoding)
 
 -- | Lift the standard 'toJSON' function through the type constructor.
 toJSON1 :: (ToJSON1 f, ToJSON a) => f a -> Value
-toJSON1 = liftToJSON toJSON toJSONList
+toJSON1 = liftToJSON omitField toJSON toJSONList
 {-# INLINE toJSON1 #-}
 
 -- | Lift the standard 'toEncoding' function through the type constructor.
 toEncoding1 :: (ToJSON1 f, ToJSON a) => f a -> Encoding
-toEncoding1 = liftToEncoding toEncoding toEncodingList
+toEncoding1 = liftToEncoding omitField toEncoding toEncodingList
 {-# INLINE toEncoding1 #-}
+
+omitField1 :: (ToJSON1 f, ToJSON a) => f a -> Bool
+omitField1 = liftOmitField omitField
 
 -- | Lifting of the 'ToJSON' class to binary type constructors.
 --
@@ -623,23 +695,31 @@ toEncoding1 = liftToEncoding toEncoding toEncodingList
 -- The compiler cannot provide a default generic implementation for 'liftToJSON2',
 -- unlike 'toJSON' and 'liftToJSON'.
 class ToJSON2 f where
-    liftToJSON2 :: (a -> Value) -> ([a] -> Value) -> (b -> Value) -> ([b] -> Value) -> f a b -> Value
-    liftToJSONList2 :: (a -> Value) -> ([a] -> Value) -> (b -> Value) -> ([b] -> Value) -> [f a b] -> Value
-    liftToJSONList2 fa ga fb gb = listValue (liftToJSON2 fa ga fb gb)
+    liftToJSON2 :: (a -> Bool) -> (a -> Value) -> ([a] -> Value) -> (b -> Bool) -> (b -> Value) -> ([b] -> Value) -> f a b -> Value
+    liftToJSONList2 ::  (a -> Bool) -> (a -> Value) -> ([a] -> Value) -> (b -> Bool) -> (b -> Value) -> ([b] -> Value) -> [f a b] -> Value
+    liftToJSONList2 oa fa ga ob fb gb = listValue (liftToJSON2 oa fa ga ob fb gb)
 
-    liftToEncoding2 :: (a -> Encoding) -> ([a] -> Encoding) -> (b -> Encoding) -> ([b] -> Encoding) -> f a b -> Encoding
-    liftToEncodingList2 :: (a -> Encoding) -> ([a] -> Encoding) -> (b -> Encoding) -> ([b] -> Encoding) -> [f a b] -> Encoding
-    liftToEncodingList2 fa ga fb gb = listEncoding (liftToEncoding2 fa ga fb gb)
+    liftToEncoding2 ::  (a -> Bool) -> (a -> Encoding) -> ([a] -> Encoding) -> (b -> Bool) -> (b -> Encoding) -> ([b] -> Encoding) -> f a b -> Encoding
+    liftToEncodingList2 ::  (a -> Bool) -> (a -> Encoding) -> ([a] -> Encoding) -> (b -> Bool) -> (b -> Encoding) -> ([b] -> Encoding) -> [f a b] -> Encoding
+    liftToEncodingList2 oa fa ga ob fb gb = listEncoding (liftToEncoding2 oa fa ga ob fb gb)
+
+    -- | @since 2.2.0.0
+    liftOmitField2 :: (a -> Bool) -> (b -> Bool) -> f a b -> Bool
+    liftOmitField2 _ _ _ = False
 
 -- | Lift the standard 'toJSON' function through the type constructor.
 toJSON2 :: (ToJSON2 f, ToJSON a, ToJSON b) => f a b -> Value
-toJSON2 = liftToJSON2 toJSON toJSONList toJSON toJSONList
+toJSON2 = liftToJSON2 omitField toJSON toJSONList omitField toJSON toJSONList
 {-# INLINE toJSON2 #-}
 
 -- | Lift the standard 'toEncoding' function through the type constructor.
 toEncoding2 :: (ToJSON2 f, ToJSON a, ToJSON b) => f a b -> Encoding
-toEncoding2 = liftToEncoding2 toEncoding toEncodingList toEncoding toEncodingList
+toEncoding2 = liftToEncoding2 omitField toEncoding toEncodingList omitField toEncoding toEncodingList
 {-# INLINE toEncoding2 #-}
+
+omitField2 :: (ToJSON2 f, ToJSON a, ToJSON b) => f a b -> Bool
+omitField2 = liftOmitField2 omitField omitField
+{-# INLINE omitField2 #-}
 
 -------------------------------------------------------------------------------
 -- Encoding functions
@@ -675,9 +755,9 @@ listValue f = Array . V.fromList . map f
 -- These are needed for key-class default definitions
 
 instance ToJSON1 [] where
-    liftToJSON _ to' = to'
+    liftToJSON _ _ to' = to'
 
-    liftToEncoding _ to' = to'
+    liftToEncoding _ _ to' = to'
 
 instance (ToJSON a) => ToJSON [a] where
     {-# SPECIALIZE instance ToJSON String #-}
@@ -693,7 +773,7 @@ instance (ToJSON a) => ToJSON [a] where
 -- Generic toJSON / toEncoding
 -------------------------------------------------------------------------------
 
-instance OVERLAPPABLE_ (GToJSON' enc arity a) => GToJSON' enc arity (M1 i c a) where
+instance {-# OVERLAPPABLE #-} (GToJSON' enc arity a) => GToJSON' enc arity (M1 i c a) where
     -- Meta-information, which is not handled elsewhere, is ignored:
     gToJSON opts targs = gToJSON opts targs . unM1
     {-# INLINE gToJSON #-}
@@ -701,7 +781,7 @@ instance OVERLAPPABLE_ (GToJSON' enc arity a) => GToJSON' enc arity (M1 i c a) w
 instance GToJSON' enc One Par1 where
     -- Direct occurrences of the last type parameter are encoded with the
     -- function passed in as an argument:
-    gToJSON _opts (To1Args tj _) = tj . unPar1
+    gToJSON _opts (To1Args _ tj _) = tj . unPar1 -- TODO
     {-# INLINE gToJSON #-}
 
 instance ( ConsToJSON enc arity a
@@ -755,7 +835,7 @@ instance ToJSON a => GToJSON' Value arity (K1 i a) where
 instance ToJSON1 f => GToJSON' Value One (Rec1 f) where
     -- Recursive occurrences of the last type parameter are encoded using their
     -- ToJSON1 instance:
-    gToJSON _opts (To1Args tj tjl) = liftToJSON tj tjl . unRec1
+    gToJSON _opts (To1Args o tj tjl) = liftToJSON o tj tjl . unRec1
     {-# INLINE gToJSON #-}
 
 instance GToJSON' Value arity U1 where
@@ -789,11 +869,17 @@ instance ( ToJSON1 f
     -- instance to generically encode the innermost type:
     gToJSON opts targs =
       let gtj = gToJSON opts targs in
-      liftToJSON gtj (listValue gtj) . unComp1
+      liftToJSON (const False) gtj (listValue gtj) . unComp1
     {-# INLINE gToJSON #-}
 
 --------------------------------------------------------------------------------
 -- Generic toEncoding
+
+instance GToJSON' Encoding arity V1 where
+    -- Empty values do not exist, which makes the job of formatting them
+    -- rather easy:
+    gToJSON _ _ x = case x of {}
+    {-# INLINE gToJSON #-}
 
 instance ToJSON a => GToJSON' Encoding arity (K1 i a) where
     -- Constant values are encoded using their ToJSON instance:
@@ -803,7 +889,7 @@ instance ToJSON a => GToJSON' Encoding arity (K1 i a) where
 instance ToJSON1 f => GToJSON' Encoding One (Rec1 f) where
     -- Recursive occurrences of the last type parameter are encoded using their
     -- ToEncoding1 instance:
-    gToJSON _opts (To1Args te tel) = liftToEncoding te tel . unRec1
+    gToJSON _opts (To1Args o te tel) = liftToEncoding o te tel . unRec1
     {-# INLINE gToJSON #-}
 
 instance GToJSON' Encoding arity U1 where
@@ -830,7 +916,7 @@ instance ( ToJSON1 f
     -- instance to generically encode the innermost type:
     gToJSON opts targs =
       let gte = gToJSON opts targs in
-      liftToEncoding gte (listEncoding gte) . unComp1
+      liftToEncoding (const False) gte (listEncoding gte) . unComp1
     {-# INLINE gToJSON #-}
 
 --------------------------------------------------------------------------------
@@ -840,7 +926,7 @@ class SumToJSON enc arity f allNullary where
               -> f a -> Tagged allNullary enc
 
 instance ( GetConName f
-         , FromString enc
+         , IsString enc
          , TaggedObject                     enc arity f
          , SumToJSON' ObjectWithSingleField enc arity f
          , SumToJSON' TwoElemArray          enc arity f
@@ -872,7 +958,7 @@ nonAllNullarySumToJSON opts targs =
     case sumEncoding opts of
 
       TaggedObject{..}      ->
-        taggedObject opts targs tagFieldName contentsFieldName
+        taggedObject opts targs (Key.fromString tagFieldName) (Key.fromString contentsFieldName)
 
       ObjectWithSingleField ->
         (unTagged :: Tagged ObjectWithSingleField enc -> enc)
@@ -889,20 +975,13 @@ nonAllNullarySumToJSON opts targs =
 
 --------------------------------------------------------------------------------
 
-class FromString enc where
-  fromString :: String -> enc
 
-instance FromString Encoding where
-  fromString = toEncoding
-
-instance FromString Value where
-  fromString = String . pack
 
 --------------------------------------------------------------------------------
 
 class TaggedObject enc arity f where
     taggedObject :: Options -> ToArgs enc arity a
-                 -> String -> String
+                 -> Key -> Key
                  -> f a -> enc
 
 instance ( TaggedObject enc arity a
@@ -918,7 +997,7 @@ instance ( TaggedObject enc arity a
 instance ( IsRecord                      a isRecord
          , TaggedObject' enc pairs arity a isRecord
          , FromPairs enc pairs
-         , FromString enc
+         , IsString enc
          , KeyValuePair enc pairs
          , Constructor c
          ) => TaggedObject enc arity (C1 c a)
@@ -936,7 +1015,7 @@ instance ( IsRecord                      a isRecord
 
 class TaggedObject' enc pairs arity f isRecord where
     taggedObject' :: Options -> ToArgs enc arity a
-                  -> String -> f a -> Tagged isRecord pairs
+                  -> Key -> f a -> Tagged isRecord pairs
 
 instance ( GToJSON' enc arity f
          , KeyValuePair enc pairs
@@ -946,7 +1025,7 @@ instance ( GToJSON' enc arity f
         Tagged . (contentsFieldName `pair`) . gToJSON opts targs
     {-# INLINE taggedObject' #-}
 
-instance OVERLAPPING_ Monoid pairs => TaggedObject' enc pairs arity U1 False where
+instance {-# OVERLAPPING #-} Monoid pairs => TaggedObject' enc pairs arity U1 False where
     taggedObject' _ _ _ _ = Tagged mempty
     {-# INLINE taggedObject' #-}
 
@@ -1006,7 +1085,7 @@ instance ( GToJSON'    Value arity a
          ) => SumToJSON' TwoElemArray Value arity (C1 c a) where
     sumToJSON' opts targs x = Tagged $ Array $ V.create $ do
       mv <- VM.unsafeNew 2
-      VM.unsafeWrite mv 0 $ String $ pack $ constructorTagModifier opts
+      VM.unsafeWrite mv 0 $ String $ T.pack $ constructorTagModifier opts
                                    $ conName (undefined :: t c a p)
       VM.unsafeWrite mv 1 $ gToJSON opts targs x
       return mv
@@ -1044,7 +1123,7 @@ instance ( IsRecord                f isRecord
       . consToJSON' opts targs
     {-# INLINE consToJSON #-}
 
-instance OVERLAPPING_
+instance {-# OVERLAPPING #-}
          ( RecordToPairs enc pairs arity (S1 s f)
          , FromPairs enc pairs
          , GToJSON' enc arity f
@@ -1088,48 +1167,54 @@ instance ( Monoid pairs
     {-# INLINE recordToPairs #-}
 
 instance ( Selector s
-         , GToJSON' enc arity a
+         , GToJSON' enc arity (K1 i t)
          , KeyValuePair enc pairs
-         ) => RecordToPairs enc pairs arity (S1 s a)
+         , ToJSON t
+         ) => RecordToPairs enc pairs arity (S1 s (K1 i t))
   where
-    recordToPairs = fieldToPair
+    recordToPairs opts targs m1
+      | omitNothingFields opts
+      , omitField (unK1 $ unM1 m1 :: t)
+      = mempty
+
+      | otherwise =
+        let key   = Key.fromString $ fieldLabelModifier opts (selName m1)
+            value = gToJSON opts targs (unM1 m1)
+         in key `pair` value
     {-# INLINE recordToPairs #-}
 
-instance INCOHERENT_
-    ( Selector s
-    , GToJSON' enc arity (K1 i (Maybe a))
-    , KeyValuePair enc pairs
-    , Monoid pairs
-    ) => RecordToPairs enc pairs arity (S1 s (K1 i (Maybe a)))
+instance ( Selector s
+         , GToJSON' enc One (Rec1 f)
+         , KeyValuePair enc pairs
+         , ToJSON1 f
+         ) => RecordToPairs enc pairs One (S1 s (Rec1 f))
   where
-    recordToPairs opts _ (M1 k1) | omitNothingFields opts
-                                 , K1 Nothing <- k1 = mempty
-    recordToPairs opts targs m1 = fieldToPair opts targs m1
+    recordToPairs opts targs@(To1Args o _ _) m1
+      | omitNothingFields opts
+      , liftOmitField o $ unRec1 $ unM1 m1
+      = mempty
+
+      | otherwise =
+        let key   = Key.fromString $ fieldLabelModifier opts (selName m1)
+            value = gToJSON opts targs (unM1 m1)
+            in key `pair` value
     {-# INLINE recordToPairs #-}
 
-instance INCOHERENT_
-    ( Selector s
-    , GToJSON' enc arity (K1 i (Maybe a))
-    , KeyValuePair enc pairs
-    , Monoid pairs
-    ) => RecordToPairs enc pairs arity (S1 s (K1 i (Semigroup.Option a)))
+instance ( Selector s
+         , GToJSON' enc One Par1
+         , KeyValuePair enc pairs
+         ) => RecordToPairs enc pairs One (S1 s Par1)
   where
-    recordToPairs opts targs = recordToPairs opts targs . unwrap
-      where
-        unwrap :: S1 s (K1 i (Semigroup.Option a)) p -> S1 s (K1 i (Maybe a)) p
-        unwrap (M1 (K1 (Semigroup.Option a))) = M1 (K1 a)
-    {-# INLINE recordToPairs #-}
+    recordToPairs opts targs@(To1Args o _ _) m1
+      | omitNothingFields opts
+      , o (unPar1 (unM1 m1))
+      = mempty
 
-fieldToPair :: (Selector s
-               , GToJSON' enc arity a
-               , KeyValuePair enc pairs)
-            => Options -> ToArgs enc arity p
-            -> S1 s a p -> pairs
-fieldToPair opts targs m1 =
-  let key   = fieldLabelModifier opts (selName m1)
-      value = gToJSON opts targs (unM1 m1)
-  in key `pair` value
-{-# INLINE fieldToPair #-}
+      | otherwise =
+        let key   = Key.fromString $ fieldLabelModifier opts (selName m1)
+            value = gToJSON opts targs (unM1 m1)
+          in key `pair` value
+    {-# INLINE recordToPairs #-}
 
 --------------------------------------------------------------------------------
 
@@ -1154,7 +1239,7 @@ instance ( WriteProduct arity a
           ixR  = ix  + lenL
     {-# INLINE writeProduct #-}
 
-instance OVERLAPPABLE_ (GToJSON' Value arity a) => WriteProduct arity a where
+instance {-# OVERLAPPABLE #-} (GToJSON' Value arity a) => WriteProduct arity a where
     writeProduct opts targs mv ix _ =
       VM.unsafeWrite mv ix . gToJSON opts targs
     {-# INLINE writeProduct #-}
@@ -1177,7 +1262,7 @@ instance ( EncodeProduct    arity a
       encodeProduct opts targs b
     {-# INLINE encodeProduct #-}
 
-instance OVERLAPPABLE_ (GToJSON' Encoding arity a) => EncodeProduct arity a where
+instance {-# OVERLAPPABLE #-} (GToJSON' Encoding arity a) => EncodeProduct arity a where
     encodeProduct opts targs a = E.retagEncoding $ gToJSON opts targs a
     {-# INLINE encodeProduct #-}
 
@@ -1193,22 +1278,22 @@ instance ( GToJSON'   enc arity a
     sumToJSON' opts targs =
       Tagged . fromPairs . (typ `pair`) . gToJSON opts targs
         where
-          typ = constructorTagModifier opts $
+          typ = Key.fromString $ constructorTagModifier opts $
                          conName (undefined :: t c a p)
     {-# INLINE sumToJSON' #-}
 
 --------------------------------------------------------------------------------
 
-instance OVERLAPPABLE_
+instance {-# OVERLAPPABLE #-}
     ( ConsToJSON enc arity a
     ) => SumToJSON' UntaggedValue enc arity (C1 c a)
   where
     sumToJSON' opts targs = Tagged . gToJSON opts targs
     {-# INLINE sumToJSON' #-}
 
-instance OVERLAPPING_
+instance {-# OVERLAPPING #-}
     ( Constructor c
-    , FromString enc
+    , IsString enc
     ) => SumToJSON' UntaggedValue enc arity (C1 c U1)
   where
     sumToJSON' opts _ _ = Tagged . fromString $
@@ -1224,43 +1309,49 @@ instance OVERLAPPING_
 -------------------------------------------------------------------------------
 
 instance ToJSON2 Const where
-    liftToJSON2 t _ _ _ (Const x) = t x
-    liftToEncoding2 t _ _ _ (Const x) = t x
+    liftToJSON2 _ t _ _ _ _ (Const x) = t x
+    liftToEncoding2 _ t _ _ _ _ (Const x) = t x
+    liftOmitField2 o _ (Const x) = o x
 
 instance ToJSON a => ToJSON1 (Const a) where
-    liftToJSON _ _ (Const x) = toJSON x
-    liftToEncoding _ _ (Const x) = toEncoding x
+    liftToJSON _ _ _ (Const x) = toJSON x
+    liftToEncoding _ _ _ (Const x) = toEncoding x
+    liftOmitField _ (Const x) = omitField x
 
 instance ToJSON a => ToJSON (Const a b) where
     toJSON (Const x) = toJSON x
     toEncoding (Const x) = toEncoding x
+    omitField (Const x) = omitField x
 
 instance (ToJSON a, ToJSONKey a) => ToJSONKey (Const a b) where
     toJSONKey = contramap getConst toJSONKey
 
 
 instance ToJSON1 Maybe where
-    liftToJSON t _ (Just a) = t a
-    liftToJSON _  _ Nothing  = Null
+    liftToJSON _ t _ (Just a) = t a
+    liftToJSON _ _  _ Nothing  = Null
 
-    liftToEncoding t _ (Just a) = t a
-    liftToEncoding _  _ Nothing  = E.null_
+    liftToEncoding _ t _ (Just a) = t a
+    liftToEncoding _ _  _ Nothing  = E.null_
+
+    liftOmitField _ = isNothing
 
 instance (ToJSON a) => ToJSON (Maybe a) where
     toJSON = toJSON1
+    omitField = omitField1
     toEncoding = toEncoding1
 
 
 instance ToJSON2 Either where
-    liftToJSON2  toA _ _toB _ (Left a)  = Object $ H.singleton "Left"  (toA a)
-    liftToJSON2 _toA _  toB _ (Right b) = Object $ H.singleton "Right" (toB b)
+    liftToJSON2 _  toA _ _ _toB _ (Left a)  = Object $ KM.singleton "Left"  (toA a)
+    liftToJSON2 _ _toA _ _  toB _ (Right b) = Object $ KM.singleton "Right" (toB b)
 
-    liftToEncoding2  toA _ _toB _ (Left a) = E.pairs $ E.pair "Left" $ toA a
-    liftToEncoding2 _toA _ toB _ (Right b) = E.pairs $ E.pair "Right" $ toB b
+    liftToEncoding2 _  toA _ _ _toB _ (Left a) = E.pairs $ E.pair "Left" $ toA a
+    liftToEncoding2 _ _toA _ _ toB _ (Right b) = E.pairs $ E.pair "Right" $ toB b
 
 instance (ToJSON a) => ToJSON1 (Either a) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b) => ToJSON (Either a b) where
     toJSON = toJSON2
@@ -1269,6 +1360,10 @@ instance (ToJSON a, ToJSON b) => ToJSON (Either a b) where
 instance ToJSON Void where
     toJSON = absurd
     toEncoding = absurd
+
+-- | @since 2.1.2.0
+instance ToJSONKey Void where
+    toJSONKey = ToJSONKeyText absurd absurd
 
 instance ToJSON Bool where
     toJSON = Bool
@@ -1291,6 +1386,7 @@ orderingToText o = case o of
 instance ToJSON () where
     toJSON _ = emptyArray
     toEncoding _ = emptyArray_
+    omitField _ = True
 
 
 instance ToJSON Char where
@@ -1307,15 +1403,6 @@ instance ToJSON Double where
 
 instance ToJSONKey Double where
     toJSONKey = toJSONKeyTextEnc E.doubleText
-
-
-instance ToJSON Number where
-    toJSON (D d) = toJSON d
-    toJSON (I i) = toJSON i
-
-    toEncoding (D d) = toEncoding d
-    toEncoding (I i) = toEncoding i
-
 
 instance ToJSON Float where
     toJSON = realFloatToJSON
@@ -1447,7 +1534,6 @@ instance ToJSON Text where
 instance ToJSONKey Text where
     toJSONKey = toJSONKeyText id
 
-
 instance ToJSON LT.Text where
     toJSON = String . LT.toStrict
     toEncoding = E.lazyText
@@ -1455,21 +1541,30 @@ instance ToJSON LT.Text where
 instance ToJSONKey LT.Text where
     toJSONKey = toJSONKeyText LT.toStrict
 
+-- | @since 2.0.2.0
+instance ToJSON ST.ShortText where
+    toJSON = String . ST.toText
+    toEncoding = E.shortText
+
+-- | @since 2.0.2.0
+instance ToJSONKey ST.ShortText where
+    toJSONKey = ToJSONKeyText Key.fromShortText E.shortText
+
 
 instance ToJSON Version where
     toJSON = toJSON . showVersion
     toEncoding = toEncoding . showVersion
 
 instance ToJSONKey Version where
-    toJSONKey = toJSONKeyText (T.pack . showVersion)
+    toJSONKey = toJSONKeyKey (Key.fromString . showVersion)
 
 -------------------------------------------------------------------------------
 -- semigroups NonEmpty
 -------------------------------------------------------------------------------
 
 instance ToJSON1 NonEmpty where
-    liftToJSON t _ = listValue t . NE.toList
-    liftToEncoding t _ = listEncoding t . NE.toList
+    liftToJSON _ t _ = listValue t . NE.toList
+    liftToEncoding _ t _ = listEncoding t . NE.toList
 
 instance (ToJSON a) => ToJSON (NonEmpty a) where
     toJSON = toJSON1
@@ -1491,42 +1586,69 @@ instance ToJSONKey Scientific where
 -------------------------------------------------------------------------------
 
 instance ToJSON1 DList.DList where
-    liftToJSON t _ = listValue t . toList
-    liftToEncoding t _ = listEncoding t . toList
+    liftToJSON _ t _ = listValue t . toList
+    liftToEncoding _ t _ = listEncoding t . toList
 
 instance (ToJSON a) => ToJSON (DList.DList a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
 
-#if MIN_VERSION_dlist(1,0,0) && __GLASGOW_HASKELL__ >=800
 -- | @since 1.5.3.0
 instance ToJSON1 DNE.DNonEmpty where
-    liftToJSON t _ = listValue t . DNE.toList
-    liftToEncoding t _ = listEncoding t . DNE.toList
+    liftToJSON _ t _ = listValue t . DNE.toList
+    liftToEncoding _ t _ = listEncoding t . DNE.toList
 
 -- | @since 1.5.3.0
 instance (ToJSON a) => ToJSON (DNE.DNonEmpty a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
-#endif
+
+-------------------------------------------------------------------------------
+-- OneTuple
+-------------------------------------------------------------------------------
+
+-- | @since 2.0.2.0
+instance ToJSON1 Solo where
+    liftToJSON _ t _ (Solo a) = t a
+    liftToJSONList _ _ tl xs = tl (map getSolo xs)
+
+    liftToEncoding _ t _ (Solo a) = t a
+    liftToEncodingList _ _ tl xs = tl (map getSolo xs)
+
+-- | @since 2.0.2.0
+instance (ToJSON a) => ToJSON (Solo a) where
+    toJSON = toJSON1
+    toJSONList = liftToJSONList omitField toJSON toJSONList
+
+    toEncoding = toEncoding1
+    toEncodingList = liftToEncodingList omitField toEncoding toEncodingList
+
+-- | @since 2.0.2.0
+instance (ToJSONKey a) => ToJSONKey (Solo a) where
+    toJSONKey = contramapToJSONKeyFunction getSolo toJSONKey
+    toJSONKeyList = contramapToJSONKeyFunction (map getSolo) toJSONKeyList
 
 -------------------------------------------------------------------------------
 -- transformers - Functors
 -------------------------------------------------------------------------------
 
 instance ToJSON1 Identity where
-    liftToJSON t _ (Identity a) = t a
-    liftToJSONList _ tl xs = tl (map runIdentity xs)
+    liftToJSON _ t _ (Identity a) = t a
+    liftToJSONList _ _ tl xs = tl (map runIdentity xs)
 
-    liftToEncoding t _ (Identity a) = t a
-    liftToEncodingList _ tl xs = tl (map runIdentity xs)
+    liftToEncoding _ t _ (Identity a) = t a
+    liftToEncodingList _ _ tl xs = tl (map runIdentity xs)
+
+    liftOmitField o (Identity a) = o a
 
 instance (ToJSON a) => ToJSON (Identity a) where
     toJSON = toJSON1
-    toJSONList = liftToJSONList toJSON toJSONList
+    toJSONList = liftToJSONList omitField toJSON toJSONList
 
     toEncoding = toEncoding1
-    toEncodingList = liftToEncodingList toEncoding toEncodingList
+    toEncodingList = liftToEncodingList omitField toEncoding toEncodingList
+
+    omitField (Identity x) = omitField x
 
 instance (ToJSONKey a) => ToJSONKey (Identity a) where
     toJSONKey = contramapToJSONKeyFunction runIdentity toJSONKey
@@ -1534,58 +1656,60 @@ instance (ToJSONKey a) => ToJSONKey (Identity a) where
 
 
 instance (ToJSON1 f, ToJSON1 g) => ToJSON1 (Compose f g) where
-    liftToJSON tv tvl (Compose x) = liftToJSON g gl x
+    liftToJSON o tv tvl (Compose x) = liftToJSON (liftOmitField o) g gl x
       where
-        g = liftToJSON tv tvl
-        gl = liftToJSONList tv tvl
+        g = liftToJSON o tv tvl
+        gl = liftToJSONList o tv tvl
 
-    liftToJSONList te tel xs = liftToJSONList g gl (map getCompose xs)
+    liftToJSONList o te tel xs = liftToJSONList (liftOmitField o) g gl (map getCompose xs)
       where
-        g = liftToJSON te tel
-        gl = liftToJSONList te tel
+        g = liftToJSON o te tel
+        gl = liftToJSONList o te tel
 
-    liftToEncoding te tel (Compose x) = liftToEncoding g gl x
+    liftToEncoding o te tel (Compose x) = liftToEncoding (liftOmitField o) g gl x
       where
-        g = liftToEncoding te tel
-        gl = liftToEncodingList te tel
+        g = liftToEncoding o te tel
+        gl = liftToEncodingList o te tel
 
-    liftToEncodingList te tel xs = liftToEncodingList g gl (map getCompose xs)
+    liftToEncodingList o te tel xs = liftToEncodingList (liftOmitField o) g gl (map getCompose xs)
       where
-        g = liftToEncoding te tel
-        gl = liftToEncodingList te tel
+        g = liftToEncoding o te tel
+        gl = liftToEncodingList o te tel
+
+    liftOmitField o (Compose xs)= liftOmitField (liftOmitField o) xs
 
 instance (ToJSON1 f, ToJSON1 g, ToJSON a) => ToJSON (Compose f g a) where
     toJSON = toJSON1
-    toJSONList = liftToJSONList toJSON toJSONList
+    toJSONList = liftToJSONList omitField toJSON toJSONList
     toEncoding = toEncoding1
-    toEncodingList = liftToEncodingList toEncoding toEncodingList
-
+    toEncodingList = liftToEncodingList omitField toEncoding toEncodingList
+    omitField = omitField1
 
 instance (ToJSON1 f, ToJSON1 g) => ToJSON1 (Product f g) where
-    liftToJSON tv tvl (Pair x y) = liftToJSON2 tx txl ty tyl (x, y)
+    liftToJSON o tv tvl (Pair x y) = liftToJSON2 (liftOmitField o) tx txl (liftOmitField o) ty tyl (x, y)
       where
-        tx = liftToJSON tv tvl
-        txl = liftToJSONList tv tvl
-        ty = liftToJSON tv tvl
-        tyl = liftToJSONList tv tvl
+        tx = liftToJSON o tv tvl
+        txl = liftToJSONList o tv tvl
+        ty = liftToJSON o tv tvl
+        tyl = liftToJSONList o tv tvl
 
-    liftToEncoding te tel (Pair x y) = liftToEncoding2 tx txl ty tyl (x, y)
+    liftToEncoding o te tel (Pair x y) = liftToEncoding2 (liftOmitField o) tx txl (liftOmitField o) ty tyl (x, y)
       where
-        tx = liftToEncoding te tel
-        txl = liftToEncodingList te tel
-        ty = liftToEncoding te tel
-        tyl = liftToEncodingList te tel
+        tx = liftToEncoding o te tel
+        txl = liftToEncodingList o te tel
+        ty = liftToEncoding o te tel
+        tyl = liftToEncodingList o te tel
 
 instance (ToJSON1 f, ToJSON1 g, ToJSON a) => ToJSON (Product f g a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
 
 instance (ToJSON1 f, ToJSON1 g) => ToJSON1 (Sum f g) where
-    liftToJSON tv tvl (InL x) = Object $ H.singleton "InL" (liftToJSON tv tvl x)
-    liftToJSON tv tvl (InR y) = Object $ H.singleton "InR" (liftToJSON tv tvl y)
+    liftToJSON o tv tvl (InL x) = Object $ KM.singleton "InL" (liftToJSON o tv tvl x)
+    liftToJSON o tv tvl (InR y) = Object $ KM.singleton "InR" (liftToJSON o tv tvl y)
 
-    liftToEncoding te tel (InL x) = E.pairs $ E.pair "InL" $ liftToEncoding te tel x
-    liftToEncoding te tel (InR y) = E.pairs $ E.pair "InR" $ liftToEncoding te tel y
+    liftToEncoding o te tel (InL x) = E.pairs $ E.pair "InL" $ liftToEncoding o te tel x
+    liftToEncoding o te tel (InR y) = E.pairs $ E.pair "InR" $ liftToEncoding o te tel y
 
 instance (ToJSON1 f, ToJSON1 g, ToJSON a) => ToJSON (Sum f g a) where
     toJSON = toJSON1
@@ -1596,8 +1720,8 @@ instance (ToJSON1 f, ToJSON1 g, ToJSON a) => ToJSON (Sum f g a) where
 -------------------------------------------------------------------------------
 
 instance ToJSON1 Seq.Seq where
-    liftToJSON t _ = listValue t . toList
-    liftToEncoding t _ = listEncoding t . toList
+    liftToJSON _ t _ = listValue t . toList
+    liftToEncoding _ t _ = listEncoding t . toList
 
 instance (ToJSON a) => ToJSON (Seq.Seq a) where
     toJSON = toJSON1
@@ -1605,8 +1729,8 @@ instance (ToJSON a) => ToJSON (Seq.Seq a) where
 
 
 instance ToJSON1 Set.Set where
-    liftToJSON t _ = listValue t . Set.toList
-    liftToEncoding t _ = listEncoding t . Set.toList
+    liftToJSON _ t _ = listValue t . Set.toList
+    liftToEncoding _ t _ = listEncoding t . Set.toList
 
 instance (ToJSON a) => ToJSON (Set.Set a) where
     toJSON = toJSON1
@@ -1617,17 +1741,16 @@ instance ToJSON IntSet.IntSet where
     toJSON = toJSON . IntSet.toList
     toEncoding = toEncoding . IntSet.toList
 
-
 instance ToJSON1 IntMap.IntMap where
-    liftToJSON t tol = liftToJSON to' tol' . IntMap.toList
+    liftToJSON o t tol = liftToJSON (liftOmitField o) to' tol' . IntMap.toList
       where
-        to'  = liftToJSON2     toJSON toJSONList t tol
-        tol' = liftToJSONList2 toJSON toJSONList t tol
+        to'  = liftToJSON2     omitField toJSON toJSONList o t tol
+        tol' = liftToJSONList2 omitField toJSON toJSONList o t tol
 
-    liftToEncoding t tol = liftToEncoding to' tol' . IntMap.toList
+    liftToEncoding o t tol = liftToEncoding (liftOmitField o) to' tol' . IntMap.toList
       where
-        to'  = liftToEncoding2     toEncoding toEncodingList t tol
-        tol' = liftToEncodingList2 toEncoding toEncodingList t tol
+        to'  = liftToEncoding2     omitField toEncoding toEncodingList o t tol
+        tol' = liftToEncodingList2 omitField toEncoding toEncodingList o t tol
 
 instance ToJSON a => ToJSON (IntMap.IntMap a) where
     toJSON = toJSON1
@@ -1635,11 +1758,11 @@ instance ToJSON a => ToJSON (IntMap.IntMap a) where
 
 
 instance ToJSONKey k => ToJSON1 (M.Map k) where
-    liftToJSON g _ = case toJSONKey of
-        ToJSONKeyText f _ -> Object . mapHashKeyVal f g
+    liftToJSON _ g _ = case toJSONKey of
+        ToJSONKeyText f _ -> Object . KM.fromMap . mapKeyValO f g
         ToJSONKeyValue  f _ -> Array . V.fromList . map (toJSONPair f g) . M.toList
 
-    liftToEncoding g _ = case toJSONKey of
+    liftToEncoding _ g _ = case toJSONKey of
         ToJSONKeyText _ f -> dict f g M.foldrWithKey
         ToJSONKeyValue _ f -> listEncoding (pairEncoding f) . M.toList
       where
@@ -1652,21 +1775,21 @@ instance (ToJSON v, ToJSONKey k) => ToJSON (M.Map k v) where
 
 
 instance ToJSON1 Tree.Tree where
-    liftToJSON t tol = go
+    liftToJSON o t tol = go
       where
         go (Tree.Node root branches) =
-            liftToJSON2 t tol to' tol' (root, branches)
+            liftToJSON2 o t tol (const False) to' tol' (root, branches)
 
-        to' = liftToJSON go (listValue go)
-        tol' = liftToJSONList go (listValue go)
+        to' = liftToJSON (const False) go (listValue go)
+        tol' = liftToJSONList (const False) go (listValue go)
 
-    liftToEncoding t tol = go
+    liftToEncoding o t tol = go
       where
         go (Tree.Node root branches) =
-            liftToEncoding2 t tol to' tol' (root, branches)
+            liftToEncoding2 o t tol (const False) to' tol' (root, branches)
 
-        to' = liftToEncoding go (listEncoding go)
-        tol' = liftToEncodingList go (listEncoding go)
+        to' = liftToEncoding (const False) go (listEncoding go)
+        tol' = liftToEncodingList (const False) go (listEncoding go)
 
 instance (ToJSON v) => ToJSON (Tree.Tree v) where
     toJSON = toJSON1
@@ -1681,7 +1804,7 @@ instance ToJSON UUID.UUID where
     toEncoding = E.unsafeToEncoding . EB.quote . B.byteString . UUID.toASCIIBytes
 
 instance ToJSONKey UUID.UUID where
-    toJSONKey = ToJSONKeyText UUID.toText $
+    toJSONKey = ToJSONKeyText (Key.fromText . UUID.toText) $
         E.unsafeToEncoding . EB.quote . B.byteString . UUID.toASCIIBytes
 
 -------------------------------------------------------------------------------
@@ -1689,8 +1812,8 @@ instance ToJSONKey UUID.UUID where
 -------------------------------------------------------------------------------
 
 instance ToJSON1 Vector where
-    liftToJSON t _ = Array . V.map t
-    liftToEncoding t _ =  listEncoding t . V.toList
+    liftToJSON _ t _ = Array . V.map t
+    liftToEncoding _ t _ =  listEncoding t . V.toList
 
 instance (ToJSON a) => ToJSON (Vector a) where
     {-# SPECIALIZE instance ToJSON Array #-}
@@ -1725,8 +1848,8 @@ instance (VG.Vector VU.Vector a, ToJSON a) => ToJSON (VU.Vector a) where
 -------------------------------------------------------------------------------
 
 instance ToJSON1 HashSet.HashSet where
-    liftToJSON t _ = listValue t . HashSet.toList
-    liftToEncoding t _ = listEncoding t . HashSet.toList
+    liftToJSON _ t _ = listValue t . HashSet.toList
+    liftToEncoding _ t _ = listEncoding t . HashSet.toList
 
 instance (ToJSON a) => ToJSON (HashSet.HashSet a) where
     toJSON = toJSON1
@@ -1734,18 +1857,31 @@ instance (ToJSON a) => ToJSON (HashSet.HashSet a) where
 
 
 instance ToJSONKey k => ToJSON1 (H.HashMap k) where
-    liftToJSON g _ = case toJSONKey of
-        ToJSONKeyText f _ -> Object . mapKeyVal f g
-        ToJSONKeyValue f _ -> Array . V.fromList . map (toJSONPair f g) . H.toList
+    liftToJSON _ g _ = case toJSONKey of
+        ToJSONKeyText f _ -> Object . KM.fromHashMap . mapKeyVal f g
+        ToJSONKeyValue f _
+          -> Array . V.fromList . map (toJSONPair f g) . H.toList
 
-    -- liftToEncoding :: forall a. (a -> Encoding) -> ([a] -> Encoding) -> H.HashMap k a -> Encoding
-    liftToEncoding g _ = case toJSONKey of
+    -- liftToEncoding :: forall a. (a -> Encoding) -> ([a] -> Encoding) -> KM.HashMap k a -> Encoding
+    liftToEncoding _ g _ = case toJSONKey of
         ToJSONKeyText _ f -> dict f g H.foldrWithKey
         ToJSONKeyValue _ f -> listEncoding (pairEncoding f) . H.toList
       where
         pairEncoding f (a, b) = E.list id [f a, g b]
 
 instance (ToJSON v, ToJSONKey k) => ToJSON (H.HashMap k v) where
+    toJSON = toJSON1
+    toEncoding = toEncoding1
+
+-------------------------------------------------------------------------------
+-- Data.Aeson.KeyMap
+-------------------------------------------------------------------------------
+
+instance ToJSON1 KM.KeyMap where
+    liftToJSON _ g _ = Object . fmap g
+    liftToEncoding _ g _ = dict E.key g KM.foldrWithKey
+
+instance (ToJSON v) => ToJSON (KM.KeyMap v) where
     {-# SPECIALIZE instance ToJSON Object #-}
 
     toJSON = toJSON1
@@ -1754,6 +1890,13 @@ instance (ToJSON v, ToJSONKey k) => ToJSON (H.HashMap k v) where
 -------------------------------------------------------------------------------
 -- aeson
 -------------------------------------------------------------------------------
+
+instance ToJSON Key where
+    toJSON = toJSON . Key.toText
+    toEncoding = E.key
+
+instance ToJSONKey Key where
+    toJSONKey = ToJSONKeyText id E.key
 
 instance ToJSON Value where
     toJSON a = a
@@ -1916,6 +2059,8 @@ instance ToJSON QuarterOfYear where
     toJSON Q3 = "q3"
     toJSON Q4 = "q4"
 
+    toEncoding = toEncodingQuarterOfYear
+
 toEncodingQuarterOfYear :: QuarterOfYear -> E.Encoding' a
 toEncodingQuarterOfYear Q1 = E.unsafeToEncoding "\"q1\""
 toEncodingQuarterOfYear Q2 = E.unsafeToEncoding "\"q2\""
@@ -1926,87 +2071,120 @@ instance ToJSONKey QuarterOfYear where
     toJSONKey = toJSONKeyTextEnc toEncodingQuarterOfYear
 
 -------------------------------------------------------------------------------
+-- base Down
+-------------------------------------------------------------------------------
+
+-- | @since 2.2.0.0
+instance ToJSON1 Down where
+    liftToJSON _ t _ = coerce t
+    liftToEncoding _ t _ = coerce t
+    liftOmitField = coerce
+
+-- | @since 2.2.0.0
+instance ToJSON a => ToJSON (Down a) where
+    toJSON = toJSON1
+    toEncoding = toEncoding1
+    omitField = omitField1
+
+-------------------------------------------------------------------------------
 -- base Monoid/Semigroup
 -------------------------------------------------------------------------------
 
 instance ToJSON1 Monoid.Dual where
-    liftToJSON t _ = t . Monoid.getDual
-    liftToEncoding t _ = t . Monoid.getDual
+    liftToJSON _ t _ = t . Monoid.getDual
+    liftToEncoding _ t _ = t . Monoid.getDual
+    liftOmitField = coerce
 
 instance ToJSON a => ToJSON (Monoid.Dual a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
-
+    omitField = omitField1
 
 instance ToJSON1 Monoid.First where
-    liftToJSON t to' = liftToJSON t to' . Monoid.getFirst
-    liftToEncoding t to' = liftToEncoding t to' . Monoid.getFirst
-
+    liftToJSON o t to' = liftToJSON o t to' . Monoid.getFirst
+    liftToEncoding o t to' = liftToEncoding o t to' . Monoid.getFirst
+    liftOmitField :: forall a. (a -> Bool) -> Monoid.First a -> Bool
+    liftOmitField _ = coerce (isNothing @a)
+    
 instance ToJSON a => ToJSON (Monoid.First a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
-
+    omitField = omitField1
 
 instance ToJSON1 Monoid.Last where
-    liftToJSON t to' = liftToJSON t to' . Monoid.getLast
-    liftToEncoding t to' = liftToEncoding t to' . Monoid.getLast
+    liftToJSON o t to' = liftToJSON o t to' . Monoid.getLast
+    liftToEncoding o t to' = liftToEncoding o t to' . Monoid.getLast
+
+    liftOmitField :: forall a. (a -> Bool) -> Monoid.Last a -> Bool
+    liftOmitField _ = coerce (isNothing @a)
 
 instance ToJSON a => ToJSON (Monoid.Last a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
-
+    omitField = omitField1
 
 instance ToJSON1 Semigroup.Min where
-    liftToJSON t _ (Semigroup.Min x) = t x
-    liftToEncoding t _ (Semigroup.Min x) = t x
+    liftToJSON _ t _ (Semigroup.Min x) = t x
+    liftToEncoding _ t _ (Semigroup.Min x) = t x
+    liftOmitField = coerce
 
 instance ToJSON a => ToJSON (Semigroup.Min a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
+    omitField = omitField1
 
 
 instance ToJSON1 Semigroup.Max where
-    liftToJSON t _ (Semigroup.Max x) = t x
-    liftToEncoding t _ (Semigroup.Max x) = t x
+    liftToJSON _ t _ (Semigroup.Max x) = t x
+    liftToEncoding _ t _ (Semigroup.Max x) = t x
+    liftOmitField = coerce
 
 instance ToJSON a => ToJSON (Semigroup.Max a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
+    omitField = omitField1
 
 instance ToJSON1 Semigroup.First where
-    liftToJSON t _ (Semigroup.First x) = t x
-    liftToEncoding t _ (Semigroup.First x) = t x
+    liftToJSON _ t _ (Semigroup.First x) = t x
+    liftToEncoding _ t _ (Semigroup.First x) = t x
+    liftOmitField = coerce
 
 instance ToJSON a => ToJSON (Semigroup.First a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
-
+    omitField = omitField1
 
 instance ToJSON1 Semigroup.Last where
-    liftToJSON t _ (Semigroup.Last x) = t x
-    liftToEncoding t _ (Semigroup.Last x) = t x
+    liftToJSON _ t _ (Semigroup.Last x) = t x
+    liftToEncoding _ t _ (Semigroup.Last x) = t x
+    liftOmitField = coerce
 
 instance ToJSON a => ToJSON (Semigroup.Last a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
-
+    omitField = omitField1
 
 instance ToJSON1 Semigroup.WrappedMonoid where
-    liftToJSON t _ (Semigroup.WrapMonoid x) = t x
-    liftToEncoding t _ (Semigroup.WrapMonoid x) = t x
-
+    liftToJSON _ t _ (Semigroup.WrapMonoid x) = t x
+    liftToEncoding _ t _ (Semigroup.WrapMonoid x) = t x
+    liftOmitField = coerce
+    
 instance ToJSON a => ToJSON (Semigroup.WrappedMonoid a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
+    omitField = omitField1
 
-
+#if !MIN_VERSION_base(4,16,0)
 instance ToJSON1 Semigroup.Option where
-    liftToJSON t to' = liftToJSON t to' . Semigroup.getOption
-    liftToEncoding t to' = liftToEncoding t to' . Semigroup.getOption
+    liftToJSON o t to' = liftToJSON o t to' . Semigroup.getOption
+    liftToEncoding o t to' = liftToEncoding o t to' . Semigroup.getOption
+    liftOmitField _ = isNothing . Semigroup.getOption
 
 instance ToJSON a => ToJSON (Semigroup.Option a) where
     toJSON = toJSON1
     toEncoding = toEncoding1
+    omitField = omitField1
+#endif
 
 -------------------------------------------------------------------------------
 -- data-fix
@@ -2014,18 +2192,35 @@ instance ToJSON a => ToJSON (Semigroup.Option a) where
 
 -- | @since 1.5.3.0
 instance ToJSON1 f => ToJSON (F.Fix f) where
-    toJSON     = go where go (F.Fix f) = liftToJSON go toJSONList f
-    toEncoding = go where go (F.Fix f) = liftToEncoding go toEncodingList f
+    toJSON     = go where go (F.Fix f) = liftToJSON omitField go toJSONList f
+    toEncoding = go where go (F.Fix f) = liftToEncoding omitField go toEncodingList f
+    omitField  = go where go (F.Fix f) = liftOmitField go f
 
 -- | @since 1.5.3.0
 instance (ToJSON1 f, Functor f) => ToJSON (F.Mu f) where
-    toJSON     = F.foldMu (liftToJSON id (listValue id))
-    toEncoding = F.foldMu (liftToEncoding id (listEncoding id))
+    toJSON     = F.foldMu (liftToJSON (const False) id (listValue id))
+    toEncoding = F.foldMu (liftToEncoding (const False) id (listEncoding id))
 
 -- | @since 1.5.3.0
 instance (ToJSON1 f, Functor f) => ToJSON (F.Nu f) where
-    toJSON     = F.foldNu (liftToJSON id (listValue id))
-    toEncoding = F.foldNu (liftToEncoding id (listEncoding id))
+    toJSON     = F.foldNu (liftToJSON (const False) id (listValue id))
+    toEncoding = F.foldNu (liftToEncoding (const False) id (listEncoding id))
+
+-------------------------------------------------------------------------------
+-- network-uri
+-------------------------------------------------------------------------------
+
+-- | @since 2.2.0.0
+instance ToJSON URI.URI where
+    toJSON uri = toJSON (URI.uriToString id uri "")
+    toEncoding = encodeURI
+
+-- | @since 2.2.0.0
+instance ToJSONKey URI.URI where
+    toJSONKey = toJSONKeyTextEnc encodeURI
+
+encodeURI :: URI.URI -> Encoding' a
+encodeURI uri = E.string (URI.uriToString id uri "")
 
 -------------------------------------------------------------------------------
 -- strict
@@ -2038,13 +2233,13 @@ instance (ToJSON a, ToJSON b) => ToJSON (S.These a b) where
 
 -- | @since 1.5.3.0
 instance ToJSON2 S.These where
-    liftToJSON2 toa toas tob tobs = liftToJSON2 toa toas tob tobs . S.toLazy
-    liftToEncoding2 toa toas tob tobs = liftToEncoding2 toa toas tob tobs . S.toLazy
+    liftToJSON2 oa toa toas ob tob tobs = liftToJSON2 oa toa toas ob tob tobs . S.toLazy
+    liftToEncoding2 oa toa toas ob tob tobs = liftToEncoding2 oa toa toas ob tob tobs . S.toLazy
 
 -- | @since 1.5.3.0
 instance ToJSON a => ToJSON1 (S.These a) where
-    liftToJSON toa tos = liftToJSON toa tos . S.toLazy
-    liftToEncoding toa tos = liftToEncoding toa tos . S.toLazy
+    liftToJSON oa toa tos = liftToJSON oa toa tos . S.toLazy
+    liftToEncoding oa toa tos = liftToEncoding oa toa tos . S.toLazy
 
 -- | @since 1.5.3.0
 instance (ToJSON a, ToJSON b) => ToJSON (S.Pair a b) where
@@ -2053,13 +2248,13 @@ instance (ToJSON a, ToJSON b) => ToJSON (S.Pair a b) where
 
 -- | @since 1.5.3.0
 instance ToJSON2 S.Pair where
-    liftToJSON2 toa toas tob tobs = liftToJSON2 toa toas tob tobs . S.toLazy
-    liftToEncoding2 toa toas tob tobs = liftToEncoding2 toa toas tob tobs . S.toLazy
+    liftToJSON2 oa toa toas ob tob tobs = liftToJSON2 oa toa toas ob tob tobs . S.toLazy
+    liftToEncoding2 oa toa toas ob tob tobs = liftToEncoding2 oa toa toas ob tob tobs . S.toLazy
 
 -- | @since 1.5.3.0
 instance ToJSON a => ToJSON1 (S.Pair a) where
-    liftToJSON toa tos = liftToJSON toa tos . S.toLazy
-    liftToEncoding toa tos = liftToEncoding toa tos . S.toLazy
+    liftToJSON oa toa tos = liftToJSON oa toa tos . S.toLazy
+    liftToEncoding oa toa tos = liftToEncoding oa toa tos . S.toLazy
 
 -- | @since 1.5.3.0
 instance (ToJSON a, ToJSON b) => ToJSON (S.Either a b) where
@@ -2068,48 +2263,54 @@ instance (ToJSON a, ToJSON b) => ToJSON (S.Either a b) where
 
 -- | @since 1.5.3.0
 instance ToJSON2 S.Either where
-    liftToJSON2 toa toas tob tobs = liftToJSON2 toa toas tob tobs . S.toLazy
-    liftToEncoding2 toa toas tob tobs = liftToEncoding2 toa toas tob tobs . S.toLazy
+    liftToJSON2 oa toa toas ob tob tobs = liftToJSON2 oa toa toas ob tob tobs . S.toLazy
+    liftToEncoding2 oa toa toas ob tob tobs = liftToEncoding2 oa toa toas ob tob tobs . S.toLazy
 
 -- | @since 1.5.3.0
 instance ToJSON a => ToJSON1 (S.Either a) where
-    liftToJSON toa tos = liftToJSON toa tos . S.toLazy
-    liftToEncoding toa tos = liftToEncoding toa tos . S.toLazy
+    liftToJSON oa toa tos = liftToJSON oa toa tos . S.toLazy
+    liftToEncoding oa toa tos = liftToEncoding oa toa tos . S.toLazy
 
 -- | @since 1.5.3.0
 instance ToJSON a => ToJSON (S.Maybe a) where
     toJSON = toJSON . S.toLazy
     toEncoding = toEncoding . S.toLazy
+    omitField = omitField . S.toLazy
 
 -- | @since 1.5.3.0
 instance ToJSON1 S.Maybe where
-    liftToJSON toa tos = liftToJSON toa tos . S.toLazy
-    liftToEncoding toa tos = liftToEncoding toa tos . S.toLazy
+    liftToJSON oa toa tos = liftToJSON oa toa tos . S.toLazy
+    liftToEncoding oa toa tos = liftToEncoding oa toa tos . S.toLazy
+    liftOmitField oa = liftOmitField oa . S.toLazy
 
 -------------------------------------------------------------------------------
 -- tagged
 -------------------------------------------------------------------------------
 
 instance ToJSON1 Proxy where
-    liftToJSON _ _ _ = Null
-    liftToEncoding _ _ _ = E.null_
+    liftToJSON _ _ _ _ = Null
+    liftToEncoding _ _ _ _ = E.null_
+    liftOmitField _ _ = True
 
 instance ToJSON (Proxy a) where
     toJSON _ = Null
     toEncoding _ = E.null_
-
+    omitField _ = True
 
 instance ToJSON2 Tagged where
-    liftToJSON2 _ _ t _ (Tagged x) = t x
-    liftToEncoding2 _ _ t _ (Tagged x) = t x
+    liftToJSON2 _ _ _ _ t _ (Tagged x) = t x
+    liftToEncoding2 _ _ _ _ t _ (Tagged x) = t x
+    liftOmitField2 _ = coerce
 
 instance ToJSON1 (Tagged a) where
-    liftToJSON t _ (Tagged x) = t x
-    liftToEncoding t _ (Tagged x) = t x
+    liftToJSON _ t _ (Tagged x) = t x
+    liftToEncoding _ t _ (Tagged x) = t x
+    liftOmitField = coerce
 
 instance ToJSON b => ToJSON (Tagged a b) where
     toJSON = toJSON1
     toEncoding = toEncoding1
+    omitField = coerce (omitField @b)
 
 instance ToJSONKey b => ToJSONKey (Tagged a b) where
     toJSONKey = contramapToJSONKeyFunction unTagged toJSONKey
@@ -2131,35 +2332,35 @@ instance (ToJSON a, ToJSON b) => ToJSON (These a b) where
 
 -- | @since 1.5.1.0
 instance ToJSON2 These where
-    liftToJSON2  toa _ _tob _ (This a)    = object [ "This" .= toa a ]
-    liftToJSON2 _toa _  tob _ (That b)    = object [ "That" .= tob b ]
-    liftToJSON2  toa _  tob _ (These a b) = object [ "This" .= toa a, "That" .= tob b ]
+    liftToJSON2 _  toa _ _ _tob _ (This a)    = object [ "This" .= toa a ]
+    liftToJSON2 _ _toa _ _  tob _ (That b)    = object [ "That" .= tob b ]
+    liftToJSON2 _  toa _ _  tob _ (These a b) = object [ "This" .= toa a, "That" .= tob b ]
 
-    liftToEncoding2  toa _ _tob _ (This a)    = E.pairs $ E.pair "This" (toa a)
-    liftToEncoding2 _toa _  tob _ (That b)    = E.pairs $ E.pair "That" (tob b)
-    liftToEncoding2  toa _  tob _ (These a b) = E.pairs $ E.pair "This" (toa a) <> E.pair "That" (tob b)
+    liftToEncoding2 _  toa _ _ _tob _ (This a)    = E.pairs $ E.pair "This" (toa a)
+    liftToEncoding2 _ _toa _ _  tob _ (That b)    = E.pairs $ E.pair "That" (tob b)
+    liftToEncoding2 _  toa _ _  tob _ (These a b) = E.pairs $ E.pair "This" (toa a) <> E.pair "That" (tob b)
 
 -- | @since 1.5.1.0
 instance ToJSON a => ToJSON1 (These a) where
-    liftToJSON _tob _ (This a)    = object [ "This" .= a ]
-    liftToJSON  tob _ (That b)    = object [ "That" .= tob b ]
-    liftToJSON  tob _ (These a b) = object [ "This" .= a, "That" .= tob b ]
+    liftToJSON _ _tob _ (This a)    = object [ "This" .= a ]
+    liftToJSON _  tob _ (That b)    = object [ "That" .= tob b ]
+    liftToJSON _  tob _ (These a b) = object [ "This" .= a, "That" .= tob b ]
 
-    liftToEncoding _tob _ (This a)    = E.pairs $ "This" .= a
-    liftToEncoding  tob _ (That b)    = E.pairs $ E.pair "That" (tob b)
-    liftToEncoding  tob _ (These a b) = E.pairs $ "This" .= a <> E.pair "That" (tob b)
+    liftToEncoding _ _tob _ (This a)    = E.pairs $ "This" .= a
+    liftToEncoding _  tob _ (That b)    = E.pairs $ E.pair "That" (tob b)
+    liftToEncoding _  tob _ (These a b) = E.pairs $ "This" .= a <> E.pair "That" (tob b)
 
 -- | @since 1.5.1.0
 instance (ToJSON1 f, ToJSON1 g) => ToJSON1 (These1 f g) where
-    liftToJSON tx tl (This1 a)    = object [ "This" .= liftToJSON tx tl a ]
-    liftToJSON tx tl (That1 b)    = object [ "That" .= liftToJSON tx tl b ]
-    liftToJSON tx tl (These1 a b) = object [ "This" .= liftToJSON tx tl a, "That" .= liftToJSON tx tl b ]
+    liftToJSON o tx tl (This1 a)    = object [ "This" .= liftToJSON o tx tl a ]
+    liftToJSON o tx tl (That1 b)    = object [ "That" .= liftToJSON o tx tl b ]
+    liftToJSON o tx tl (These1 a b) = object [ "This" .= liftToJSON o tx tl a, "That" .= liftToJSON o tx tl b ]
 
-    liftToEncoding tx tl (This1 a)    = E.pairs $ E.pair "This" (liftToEncoding tx tl a)
-    liftToEncoding tx tl (That1 b)    = E.pairs $ E.pair "That" (liftToEncoding tx tl b)
-    liftToEncoding tx tl (These1 a b) = E.pairs $
-        pair "This" (liftToEncoding tx tl a) `mappend`
-        pair "That" (liftToEncoding tx tl b)
+    liftToEncoding o tx tl (This1 a)    = E.pairs $ E.pair "This" (liftToEncoding o tx tl a)
+    liftToEncoding o tx tl (That1 b)    = E.pairs $ E.pair "That" (liftToEncoding o tx tl b)
+    liftToEncoding o tx tl (These1 a b) = E.pairs $
+        pair "This" (liftToEncoding o tx tl a) `mappend`
+        pair "That" (liftToEncoding o tx tl b)
 
 -- | @since 1.5.1.0
 instance (ToJSON1 f, ToJSON1 g, ToJSON a) => ToJSON (These1 f g a) where
@@ -2175,7 +2376,7 @@ instance (ToJSON a, ToJSON b, ToJSON c) => ToJSONKey (a,b,c)
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d) => ToJSONKey (a,b,c,d)
 
 instance ToJSONKey Char where
-    toJSONKey = ToJSONKeyText T.singleton (E.string . (:[]))
+    toJSONKey = toJSONKeyText T.singleton
     toJSONKeyList = toJSONKeyText T.pack
 
 instance (ToJSONKey a, ToJSON a) => ToJSONKey [a] where
@@ -2186,46 +2387,47 @@ instance (ToJSONKey a, ToJSON a) => ToJSONKey [a] where
 -------------------------------------------------------------------------------
 
 instance ToJSON2 (,) where
-    liftToJSON2 toA _ toB _ (a, b) = Array $ V.create $ do
+    liftToJSON2 _ toA _ _ toB _ (a, b) = Array $ V.create $ do
         mv <- VM.unsafeNew 2
         VM.unsafeWrite mv 0 (toA a)
         VM.unsafeWrite mv 1 (toB b)
         return mv
 
-    liftToEncoding2 toA _ toB _ (a, b) = E.list id [toA a, toB b]
+    liftToEncoding2 _ toA _ _ toB _ (a, b) = E.list id [toA a, toB b]
 
 instance (ToJSON a) => ToJSON1 ((,) a) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b) => ToJSON (a, b) where
     toJSON = toJSON2
     toEncoding = toEncoding2
+    -- omitField = omitField2
 
 instance (ToJSON a) => ToJSON2 ((,,) a) where
-    liftToJSON2 toB _ toC _ (a, b, c) = Array $ V.create $ do
+    liftToJSON2 _ toB _ _ toC _ (a, b, c) = Array $ V.create $ do
         mv <- VM.unsafeNew 3
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toB b)
         VM.unsafeWrite mv 2 (toC c)
         return mv
 
-    liftToEncoding2 toB _ toC _ (a, b, c) = E.list id
+    liftToEncoding2 _ toB _ _ toC _ (a, b, c) = E.list id
       [ toEncoding a
       , toB b
       , toC c
       ]
 
 instance (ToJSON a, ToJSON b) => ToJSON1 ((,,) a b) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c) => ToJSON (a, b, c) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b) => ToJSON2 ((,,,) a b) where
-    liftToJSON2 toC _ toD _ (a, b, c, d) = Array $ V.create $ do
+    liftToJSON2 _ toC _ _ toD _ (a, b, c, d) = Array $ V.create $ do
         mv <- VM.unsafeNew 4
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2233,7 +2435,7 @@ instance (ToJSON a, ToJSON b) => ToJSON2 ((,,,) a b) where
         VM.unsafeWrite mv 3 (toD d)
         return mv
 
-    liftToEncoding2 toC _ toD _ (a, b, c, d) = E.list id
+    liftToEncoding2 _ toC _ _ toD _ (a, b, c, d) = E.list id
       [ toEncoding a
       , toEncoding b
       , toC c
@@ -2241,15 +2443,15 @@ instance (ToJSON a, ToJSON b) => ToJSON2 ((,,,) a b) where
       ]
 
 instance (ToJSON a, ToJSON b, ToJSON c) => ToJSON1 ((,,,) a b c) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d) => ToJSON (a, b, c, d) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c) => ToJSON2 ((,,,,) a b c) where
-    liftToJSON2 toD _ toE _ (a, b, c, d, e) = Array $ V.create $ do
+    liftToJSON2 _ toD _ _ toE _ (a, b, c, d, e) = Array $ V.create $ do
         mv <- VM.unsafeNew 5
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2258,7 +2460,7 @@ instance (ToJSON a, ToJSON b, ToJSON c) => ToJSON2 ((,,,,) a b c) where
         VM.unsafeWrite mv 4 (toE e)
         return mv
 
-    liftToEncoding2 toD _ toE _ (a, b, c, d, e) = E.list id
+    liftToEncoding2 _ toD _ _ toE _ (a, b, c, d, e) = E.list id
       [ toEncoding a
       , toEncoding b
       , toEncoding c
@@ -2267,15 +2469,15 @@ instance (ToJSON a, ToJSON b, ToJSON c) => ToJSON2 ((,,,,) a b c) where
       ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d) => ToJSON1 ((,,,,) a b c d) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e) => ToJSON (a, b, c, d, e) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d) => ToJSON2 ((,,,,,) a b c d) where
-    liftToJSON2 toE _ toF _ (a, b, c, d, e, f) = Array $ V.create $ do
+    liftToJSON2 _ toE _ _ toF _ (a, b, c, d, e, f) = Array $ V.create $ do
         mv <- VM.unsafeNew 6
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2285,7 +2487,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d) => ToJSON2 ((,,,,,) a b c d) w
         VM.unsafeWrite mv 5 (toF f)
         return mv
 
-    liftToEncoding2 toE _ toF _ (a, b, c, d, e, f) = E.list id
+    liftToEncoding2 _ toE _ _ toF _ (a, b, c, d, e, f) = E.list id
       [ toEncoding a
       , toEncoding b
       , toEncoding c
@@ -2295,15 +2497,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d) => ToJSON2 ((,,,,,) a b c d) w
       ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e) => ToJSON1 ((,,,,,) a b c d e) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f) => ToJSON (a, b, c, d, e, f) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e) => ToJSON2 ((,,,,,,) a b c d e) where
-    liftToJSON2 toF _ toG _ (a, b, c, d, e, f, g) = Array $ V.create $ do
+    liftToJSON2 _ toF _ _ toG _ (a, b, c, d, e, f, g) = Array $ V.create $ do
         mv <- VM.unsafeNew 7
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2314,7 +2516,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e) => ToJSON2 ((,,,,,,)
         VM.unsafeWrite mv 6 (toG g)
         return mv
 
-    liftToEncoding2 toF _ toG _ (a, b, c, d, e, f, g) = E.list id
+    liftToEncoding2 _ toF _ _ toG _ (a, b, c, d, e, f, g) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2325,15 +2527,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e) => ToJSON2 ((,,,,,,)
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f) => ToJSON1 ((,,,,,,) a b c d e f) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g) => ToJSON (a, b, c, d, e, f, g) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f) => ToJSON2 ((,,,,,,,) a b c d e f) where
-    liftToJSON2 toG _ toH _ (a, b, c, d, e, f, g, h) = Array $ V.create $ do
+    liftToJSON2 _ toG _ _ toH _ (a, b, c, d, e, f, g, h) = Array $ V.create $ do
         mv <- VM.unsafeNew 8
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2345,7 +2547,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f) => ToJSON2
         VM.unsafeWrite mv 7 (toH h)
         return mv
 
-    liftToEncoding2 toG _ toH _ (a, b, c, d, e, f, g, h) = E.list id
+    liftToEncoding2 _ toG _ _ toH _ (a, b, c, d, e, f, g, h) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2357,15 +2559,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f) => ToJSON2
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g) => ToJSON1 ((,,,,,,,) a b c d e f g) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h) => ToJSON (a, b, c, d, e, f, g, h) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g) => ToJSON2 ((,,,,,,,,) a b c d e f g) where
-    liftToJSON2 toH _ toI _ (a, b, c, d, e, f, g, h, i) = Array $ V.create $ do
+    liftToJSON2 _ toH _ _ toI _ (a, b, c, d, e, f, g, h, i) = Array $ V.create $ do
         mv <- VM.unsafeNew 9
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2378,7 +2580,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g) 
         VM.unsafeWrite mv 8 (toI i)
         return mv
 
-    liftToEncoding2 toH _ toI _ (a, b, c, d, e, f, g, h, i) = E.list id
+    liftToEncoding2 _ toH _ _ toI _ (a, b, c, d, e, f, g, h, i) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2391,15 +2593,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g) 
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h) => ToJSON1 ((,,,,,,,,) a b c d e f g h) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i) => ToJSON (a, b, c, d, e, f, g, h, i) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h) => ToJSON2 ((,,,,,,,,,) a b c d e f g h) where
-    liftToJSON2 toI _ toJ _ (a, b, c, d, e, f, g, h, i, j) = Array $ V.create $ do
+    liftToJSON2 _ toI _ _ toJ _ (a, b, c, d, e, f, g, h, i, j) = Array $ V.create $ do
         mv <- VM.unsafeNew 10
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2413,7 +2615,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         VM.unsafeWrite mv 9 (toJ j)
         return mv
 
-    liftToEncoding2 toI _ toJ _ (a, b, c, d, e, f, g, h, i, j) = E.list id
+    liftToEncoding2 _ toI _ _ toJ _ (a, b, c, d, e, f, g, h, i, j) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2427,15 +2629,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i) => ToJSON1 ((,,,,,,,,,) a b c d e f g h i) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j) => ToJSON (a, b, c, d, e, f, g, h, i, j) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i) => ToJSON2 ((,,,,,,,,,,) a b c d e f g h i) where
-    liftToJSON2 toJ _ toK _ (a, b, c, d, e, f, g, h, i, j, k) = Array $ V.create $ do
+    liftToJSON2 _ toJ _ _ toK _ (a, b, c, d, e, f, g, h, i, j, k) = Array $ V.create $ do
         mv <- VM.unsafeNew 11
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2450,7 +2652,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         VM.unsafeWrite mv 10 (toK k)
         return mv
 
-    liftToEncoding2 toJ _ toK _ (a, b, c, d, e, f, g, h, i, j, k) = E.list id
+    liftToEncoding2 _ toJ _ _ toK _ (a, b, c, d, e, f, g, h, i, j, k) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2465,15 +2667,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j) => ToJSON1 ((,,,,,,,,,,) a b c d e f g h i j) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k) => ToJSON (a, b, c, d, e, f, g, h, i, j, k) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j) => ToJSON2 ((,,,,,,,,,,,) a b c d e f g h i j) where
-    liftToJSON2 toK _ toL _ (a, b, c, d, e, f, g, h, i, j, k, l) = Array $ V.create $ do
+    liftToJSON2 _ toK _ _ toL _ (a, b, c, d, e, f, g, h, i, j, k, l) = Array $ V.create $ do
         mv <- VM.unsafeNew 12
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2489,7 +2691,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         VM.unsafeWrite mv 11 (toL l)
         return mv
 
-    liftToEncoding2 toK _ toL _ (a, b, c, d, e, f, g, h, i, j, k, l) = E.list id
+    liftToEncoding2 _ toK _ _ toL _ (a, b, c, d, e, f, g, h, i, j, k, l) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2505,15 +2707,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k) => ToJSON1 ((,,,,,,,,,,,) a b c d e f g h i j k) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l) => ToJSON (a, b, c, d, e, f, g, h, i, j, k, l) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k) => ToJSON2 ((,,,,,,,,,,,,) a b c d e f g h i j k) where
-    liftToJSON2 toL _ toM _ (a, b, c, d, e, f, g, h, i, j, k, l, m) = Array $ V.create $ do
+    liftToJSON2 _ toL _ _ toM _ (a, b, c, d, e, f, g, h, i, j, k, l, m) = Array $ V.create $ do
         mv <- VM.unsafeNew 13
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2530,7 +2732,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         VM.unsafeWrite mv 12 (toM m)
         return mv
 
-    liftToEncoding2 toL _ toM _ (a, b, c, d, e, f, g, h, i, j, k, l, m) = E.list id
+    liftToEncoding2 _ toL _ _ toM _ (a, b, c, d, e, f, g, h, i, j, k, l, m) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2547,15 +2749,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l) => ToJSON1 ((,,,,,,,,,,,,) a b c d e f g h i j k l) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l, ToJSON m) => ToJSON (a, b, c, d, e, f, g, h, i, j, k, l, m) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l) => ToJSON2 ((,,,,,,,,,,,,,) a b c d e f g h i j k l) where
-    liftToJSON2 toM _ toN _ (a, b, c, d, e, f, g, h, i, j, k, l, m, n) = Array $ V.create $ do
+    liftToJSON2 _ toM _ _ toN _ (a, b, c, d, e, f, g, h, i, j, k, l, m, n) = Array $ V.create $ do
         mv <- VM.unsafeNew 14
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2573,7 +2775,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         VM.unsafeWrite mv 13 (toN n)
         return mv
 
-    liftToEncoding2 toM _ toN _ (a, b, c, d, e, f, g, h, i, j, k, l, m, n) = E.list id
+    liftToEncoding2 _ toM _ _ toN _ (a, b, c, d, e, f, g, h, i, j, k, l, m, n) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2591,15 +2793,15 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l, ToJSON m) => ToJSON1 ((,,,,,,,,,,,,,) a b c d e f g h i j k l m) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l, ToJSON m, ToJSON n) => ToJSON (a, b, c, d, e, f, g, h, i, j, k, l, m, n) where
     toJSON = toJSON2
     toEncoding = toEncoding2
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l, ToJSON m) => ToJSON2 ((,,,,,,,,,,,,,,) a b c d e f g h i j k l m) where
-    liftToJSON2 toN _ toO _ (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) = Array $ V.create $ do
+    liftToJSON2 _ toN _ _ toO _ (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) = Array $ V.create $ do
         mv <- VM.unsafeNew 15
         VM.unsafeWrite mv 0 (toJSON a)
         VM.unsafeWrite mv 1 (toJSON b)
@@ -2618,7 +2820,7 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         VM.unsafeWrite mv 14 (toO o)
         return mv
 
-    liftToEncoding2 toN _ toO _ (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) = E.list id
+    liftToEncoding2 _ toN _ _ toO _ (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) = E.list id
         [ toEncoding a
         , toEncoding b
         , toEncoding c
@@ -2637,8 +2839,8 @@ instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, 
         ]
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l, ToJSON m, ToJSON n) => ToJSON1 ((,,,,,,,,,,,,,,) a b c d e f g h i j k l m n) where
-    liftToJSON = liftToJSON2 toJSON toJSONList
-    liftToEncoding = liftToEncoding2 toEncoding toEncodingList
+    liftToJSON = liftToJSON2 omitField toJSON toJSONList
+    liftToEncoding = liftToEncoding2 omitField toEncoding toEncodingList
 
 instance (ToJSON a, ToJSON b, ToJSON c, ToJSON d, ToJSON e, ToJSON f, ToJSON g, ToJSON h, ToJSON i, ToJSON j, ToJSON k, ToJSON l, ToJSON m, ToJSON n, ToJSON o) => ToJSON (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) where
     toJSON = toJSON2
@@ -2662,12 +2864,12 @@ instance FromPairs Value (DList Pair) where
 -- ('Value' or 'Encoding'), and the result actually represents lists of pairs
 -- so it can be readily concatenated.
 class Monoid kv => KeyValuePair v kv where
-    pair :: String -> v -> kv
+    pair :: Key -> v -> kv
 
 instance (v ~ Value) => KeyValuePair v (DList Pair) where
-    pair k v = DList.singleton (pack k .= v)
+    pair k v = DList.singleton (k .= v)
     {-# INLINE pair #-}
 
 instance (e ~ Encoding) => KeyValuePair e Series where
-    pair = E.pairStr
+    pair = E.pair
     {-# INLINE pair #-}

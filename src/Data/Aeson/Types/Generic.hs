@@ -5,12 +5,9 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
-
-#include "overlapping-compat.h"
 
 -- |
 -- Module:      Data.Aeson.Types.Generic
@@ -38,20 +35,16 @@ module Data.Aeson.Types.Generic
     , (:*)(..)
     ) where
 
-import Prelude.Compat
+import Data.Kind (Type)
 
 import GHC.Generics
 
 --------------------------------------------------------------------------------
 
-class IsRecord (f :: * -> *) isRecord | f -> isRecord
+class IsRecord (f :: Type -> Type) isRecord | f -> isRecord
 
 instance (IsRecord f isRecord) => IsRecord (f :*: g) isRecord
-#if MIN_VERSION_base(4,9,0)
-instance OVERLAPPING_ IsRecord (M1 S ('MetaSel 'Nothing u ss ds) f) False
-#else
-instance OVERLAPPING_ IsRecord (M1 S NoSelector f) False
-#endif
+instance {-# OVERLAPPING #-} IsRecord (M1 S ('MetaSel 'Nothing u ss ds) f) False
 instance (IsRecord f isRecord) => IsRecord (M1 S c f) isRecord
 instance IsRecord (K1 i c) True
 instance IsRecord Par1 True
@@ -61,7 +54,7 @@ instance IsRecord U1 False
 
 --------------------------------------------------------------------------------
 
-class AllNullary (f :: * -> *) allNullary | f -> allNullary
+class AllNullary (f :: Type -> Type) allNullary | f -> allNullary
 
 instance ( AllNullary a allNullaryL
          , AllNullary b allNullaryR
@@ -75,7 +68,7 @@ instance AllNullary Par1 False
 instance AllNullary (Rec1 f) False
 instance AllNullary U1 True
 
-newtype Tagged2 (s :: * -> *) b = Tagged2 {unTagged2 :: b}
+newtype Tagged2 (s :: Type -> Type) b = Tagged2 {unTagged2 :: b}
   deriving Functor
 
 --------------------------------------------------------------------------------

@@ -1,5 +1,4 @@
 {-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE TupleSections #-}
 -- |
 -- Module:      Data.Aeson.Encoding.Builder
@@ -38,24 +37,35 @@ module Data.Aeson.Encoding.Builder
     , ascii5
     ) where
 
-import Prelude.Compat
+import Data.Aeson.Internal.Prelude
 
-import Data.Aeson.Internal.Time
-import Data.ByteString.Builder.Scientific (formatScientificBuilder, FPFormat(..))
-import Data.Aeson.Types.Internal (Value (..))
-import Data.ByteString.Builder as B
-import Data.ByteString.Builder.Prim as BP
-import Data.ByteString.Builder.Scientific (scientificBuilder)
-import Data.Char (chr, ord)
+-- import Data.Aeson.Internal.Time
+-- import Data.Aeson.Types.Internal (Value (..))
+-- import Data.ByteString.Builder as B
+-- import Data.ByteString.Builder.Prim as BP
+-- import Data.ByteString.Builder.Scientific (scientificBuilder)
+-- import Data.Char (chr, ord)
 import Data.Scientific (Scientific, isInteger, base10Exponent)
+
+import Data.Aeson.Types.Internal (Value (..), Key)
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
+import Data.ByteString.Builder (Builder)
+import qualified Data.ByteString.Builder as B
+import Data.ByteString.Builder.Prim ((>$<), (>*<))
+import qualified Data.ByteString.Builder.Prim as BP
+import Data.ByteString.Builder.Scientific (scientificBuilder)
+import Data.ByteString.Builder.Scientific (formatScientificBuilder, FPFormat(..))
+import Data.Char (chr, ord)
+import Data.Fixed (Fixed (..))
+import Data.Scientific (base10Exponent, coefficient)
 import Data.Text.Encoding (encodeUtf8BuilderEscaped)
 import Data.Time (UTCTime(..))
 import Data.Time.Calendar (Day(..), toGregorian)
 import Data.Time.Calendar.Month.Compat (Month, toYearMonth)
 import Data.Time.Calendar.Quarter.Compat (Quarter, toYearQuarter, QuarterOfYear (..))
-import Data.Time.LocalTime
-import Data.Word (Word8)
-import qualified Data.HashMap.Strict as HMS
+import Data.Time.LocalTime (LocalTime (..), TimeZone (..), ZonedTime (..), TimeOfDay (..))
+import Data.Time.Clock.Compat (DiffTime, diffTimeToPicoseconds)
 import qualified Data.Text as T
 import qualified Data.Vector as V
 
@@ -91,13 +101,17 @@ array v
     withComma a z = B.char8 ',' <> encodeToBuilder a <> z
 
 -- Encode a JSON object.
-object :: HMS.HashMap T.Text Value -> Builder
-object m = case HMS.toList m of
+object :: KM.KeyMap Value -> Builder
+object m = case KM.toList m of
     (x:xs) -> B.char8 '{' <> one x <> foldr withComma (B.char8 '}') xs
     _      -> emptyObject_
   where
     withComma a z = B.char8 ',' <> one a <> z
-    one (k,v)     = text k <> B.char8 ':' <> encodeToBuilder v
+    one (k,v)     = key k <> B.char8 ':' <> encodeToBuilder v
+
+-- | Encode a JSON key.
+key :: Key -> Builder
+key = text . Key.toText
 
 -- | Encode a JSON string.
 text :: T.Text -> Builder
@@ -286,3 +300,28 @@ twoDigits a     = T (digit hi) (digit lo)
 
 digit :: Int -> Char
 digit x = chr (x + 48)
+
+-------------------------------------------------------------------------------
+-- TimeOfDay64
+-------------------------------------------------------------------------------
+
+-- | Like TimeOfDay, but using a fixed-width integer for seconds.
+data TimeOfDay64 = TOD {-# UNPACK #-} !Int
+                       {-# UNPACK #-} !Int
+                       {-# UNPACK #-} !Int64
+
+toTimeOfDay64 :: TimeOfDay -> TimeOfDay64
+toTimeOfDay64 (TimeOfDay h m (MkFixed s)) = TOD h m (fromIntegral s)
+
+posixDayLength :: DiffTime
+posixDayLength = 86400
+
+diffTimeOfDay64 :: DiffTime -> TimeOfDay64
+diffTimeOfDay64 t
+  | t >= posixDayLength = TOD 23 59 (60000000000000 + pico (t - posixDayLength))
+  | otherwise = TOD (fromIntegral h) (fromIntegral m) s
+    where (h,mp) = pico t `quotRem` 3600000000000000
+          (m,s)  = mp `quotRem` 60000000000000
+          pico   = fromIntegral . diffTimeToPicoseconds
+
+

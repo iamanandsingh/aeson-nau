@@ -5,17 +5,19 @@
 module CompareWithJSON (benchmark) where
 
 import Prelude.Compat
+import Bench
 
 import Blaze.ByteString.Builder (toLazyByteString)
 import Blaze.ByteString.Builder.Char.Utf8 (fromString)
 import Control.DeepSeq (NFData(rnf))
-import Criterion.Main
 import Data.Maybe (fromMaybe)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Text as A
 import qualified Data.Aeson.Parser.Internal as I
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Lazy          as TL
 import qualified Data.Text.Lazy.Builder  as TLB
 import qualified Data.Text.Lazy.Encoding as TLE
@@ -47,11 +49,32 @@ decode' :: BL.ByteString -> A.Value
 decode' s = fromMaybe (error "fail to parse via Aeson") $ A.decode' s
 
 decodeS :: BS.ByteString -> A.Value
-decodeS s = fromMaybe (error "fail to parse via Aeson") $ A.decodeStrict' s
+decodeS s = fromMaybe (error "fail to parse via Aeson") $ A.decodeStrict s
 
-decodeIP :: BL.ByteString -> A.Value
-decodeIP s = fromMaybe (error "fail to parse via Parser.decodeWith") $
+decodeS' :: BS.ByteString -> A.Value
+decodeS' s = fromMaybe (error "fail to parse via Aeson") $ A.decodeStrict' s
+
+decodeT :: T.Text -> A.Value
+decodeT t = fromMaybe (error "fail to parse via Aeson") $ A.decodeStrictText t
+
+decodeTviaBS :: T.Text -> A.Value
+decodeTviaBS t = fromMaybe (error "fail to parse via Aeson") $ A.decodeStrict $ TE.encodeUtf8 t
+
+decodeAtto :: BL.ByteString -> A.Value
+decodeAtto s = fromMaybe (error "fail to parse via Parser.decodeWith") $
     I.decodeWith I.jsonEOF A.fromJSON s
+
+decodeAtto' :: BL.ByteString -> A.Value
+decodeAtto' s = fromMaybe (error "fail to parse via Parser.decodeWith") $
+    I.decodeWith I.jsonEOF' A.fromJSON s
+
+decodeAttoS :: BS.ByteString -> A.Value
+decodeAttoS s = fromMaybe (error "fail to parse via Parser.decodeWith") $
+    I.decodeStrictWith I.jsonEOF A.fromJSON s
+
+decodeAttoS' :: BS.ByteString -> A.Value
+decodeAttoS' s = fromMaybe (error "fail to parse via Parser.decodeWith") $
+    I.decodeStrictWith I.jsonEOF' A.fromJSON s
 
 encodeJ :: J.JSValue -> BL.ByteString
 encodeJ = toLazyByteString . fromString . J.encode
@@ -67,22 +90,54 @@ benchmark =
   env (readL enFile) $ \enA ->
   env (readS enFile) $ \enS ->
   env (readStr enFile) $ \enJ ->
+  env (readT enFile) $ \enT ->
   env (readL jpFile) $ \jpA ->
   env (readS jpFile) $ \jpS ->
   env (readStr jpFile) $ \jpJ ->
+  env (readT jpFile) $ \jpT ->
   bgroup "compare-json" [
       bgroup "decode" [
-        bgroup "en" [
-          bench "aeson/lazy"     $ nf decode enA
-        , bench "aeson/strict"   $ nf decode' enA
-        , bench "aeson/stricter" $ nf decodeS enS
-        , bench "aeson/parser"   $ nf decodeIP enA
-        , bench "json"           $ nf decodeJ enJ
+        bgroup "whnf" [
+          -- Note: we use whnf to only force the outer constructor,
+          -- which may force different amount of value substructure.
+          bench "aeson/normal"      $ whnf decode enA
+        , bench "aeson/normal'"     $ whnf decode' enA
+        , bench "aeson/strict"      $ whnf decodeS enS
+        , bench "aeson/strict'"     $ whnf decodeS' enS
+        , bench "aeson/text"        $ whnf decodeT enT
+        , bench "aeson/text-via-bs" $ whnf decodeTviaBS enT
+
+          -- attoparsec-aeson package
+        , bench "aeson/atto"        $ whnf decodeAtto enA
+        , bench "aeson/atto'"       $ whnf decodeAtto' enA
+        , bench "aeson/attoS"       $ whnf decodeAttoS enS
+        , bench "aeson/attoS'"      $ whnf decodeAttoS' enS
+
+          -- json package
+        , bench "json"              $ whnf decodeJ enJ
+        ]
+
+      , bgroup "nf" [
+          bench "aeson/normal"      $ nf decode enA
+        , bench "aeson/normal"      $ nf decode' enA
+        , bench "aeson/strict"      $ nf decodeS enS
+        , bench "aeson/strict'"     $ nf decodeS' enS
+
+          -- attoparsec-aeson package
+        , bench "aeson/atto"        $ nf decodeAtto enA
+        , bench "aeson/atto'"       $ nf decodeAtto' enA
+        , bench "aeson/attoS"       $ nf decodeAttoS enS
+        , bench "aeson/attoS'"      $ nf decodeAttoS' enS
+
+          -- json package
+        , bench "json"              $ nf decodeJ enJ
         ]
       , bgroup "jp" [
-          bench "aeson"          $ nf decode jpA
-        , bench "aeson/stricter" $ nf decodeS jpS
-        , bench "json"           $ nf decodeJ jpJ
+          bench "aeson/normal"      $ whnf decode jpA
+        , bench "aeson/strict"      $ whnf decodeS jpS
+        , bench "aeson/text"        $ whnf decodeT jpT
+        , bench "aeson/text-via-bs" $ whnf decodeTviaBS jpT
+        , bench "json"              $ whnf decodeJ jpJ
         ]
       ]
     , bgroup "encode" [

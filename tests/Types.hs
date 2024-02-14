@@ -13,19 +13,22 @@ module Types (module Types) where
 import Prelude.Compat
 
 import Math.NumberTheory.Logarithms (intLog2)
-import Control.Applicative ((<$>))
 import Data.Data
 import Data.Functor.Compose (Compose (..))
 import Data.Functor.Identity (Identity (..))
 import Data.Hashable (Hashable (..))
+#if !MIN_VERSION_base(4,16,0)
 import Data.Semigroup (Option)
-import Data.Text
+#endif
+import Data.Text (Text)
 import Data.Time (Day (..), fromGregorian)
 import GHC.Generics
 import Test.QuickCheck (Arbitrary (..), Property, counterexample, scale)
+import Test.QuickCheck.Gen (chooseUpTo)
 import qualified Data.Map as Map
 import Data.Aeson
 import Data.Aeson.Types
+import Data.Word (Word64)
 
 type I = Identity
 type Compose3  f g h = Compose (Compose f g) h
@@ -44,6 +47,8 @@ data UFoo = UFoo {
       _UFooInt :: Int
     , uFooInt :: Int
     } deriving (Show, Eq, Data, Typeable)
+
+data NoConstructors
 
 data OneConstructor = OneConstructor
                       deriving (Show, Eq, Typeable, Data)
@@ -78,18 +83,6 @@ data SomeType a = Nullary
                 | List [a]
   deriving (Eq, Show)
 
--- | This type requires IncoherentInstances for the instances of the type
--- classes Data.Aeson.TH.LookupField and Data.Aeson.Types.FromJSON.FromRecord.
---
--- The minimum known requirements for this type are:
--- * Record type with at least two fields
--- * One field type is either a type parameter or a type/data family
--- * Another field type is a @Maybe@ of the above field type
-data IncoherentInstancesNeeded a = IncoherentInstancesNeeded
-  { incoherentInstancesNeededMaybeNot :: a
-  , incoherentInstancesNeededMaybeYes :: Maybe a
-  } deriving Generic
-
 -- Used for testing UntaggedValue SumEncoding
 data EitherTextInt
     = LeftBool Bool
@@ -107,11 +100,14 @@ deriving instance Eq   (GADT a)
 deriving instance Show (GADT a)
 
 newtype MaybeField = MaybeField { maybeField :: Maybe Int }
+#if !MIN_VERSION_base(4,16,0)
 newtype OptionField = OptionField { optionField :: Option Int }
   deriving (Eq, Show)
+#endif
 
 deriving instance Generic Foo
 deriving instance Generic UFoo
+deriving instance Generic NoConstructors
 deriving instance Generic OneConstructor
 deriving instance Generic (Product2 a b)
 deriving instance Generic (Product6 a b c d e f)
@@ -120,7 +116,9 @@ deriving instance Generic (Approx a)
 deriving instance Generic Nullary
 deriving instance Generic (SomeType a)
 deriving instance Generic1 SomeType
+#if !MIN_VERSION_base(4,16,0)
 deriving instance Generic OptionField
+#endif
 deriving instance Generic EitherTextInt
 
 failure :: Show a => String -> String -> a -> Property
@@ -168,3 +166,13 @@ instance (ToJSONKey a) => ToJSONKey (LogScaled a) where
 instance (FromJSONKey a) => FromJSONKey (LogScaled a) where
     fromJSONKey = fmap LogScaled fromJSONKey
     fromJSONKeyList = coerceFromJSONKeyFunction (fromJSONKeyList :: FromJSONKeyFunction [a])
+
+newtype UniformWord64 = U64 Word64
+  deriving (Eq, Ord)
+
+instance Show UniformWord64 where
+    showsPrec d (U64 w) = showsPrec d w
+
+instance Arbitrary UniformWord64 where
+    arbitrary = U64 <$> chooseUpTo maxBound
+    shrink (U64 w) = map U64 (shrink w)

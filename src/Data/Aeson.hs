@@ -1,4 +1,4 @@
-{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 -- |
 -- Module:      Data.Aeson
 -- Copyright:   (c) 2011-2016 Bryan O'Sullivan
@@ -34,6 +34,12 @@ module Data.Aeson
 
     -- ** Direct encoding
     -- $encoding
+
+    -- * Remarks on specific encodings
+    -- ** Time
+    -- $time
+
+    -- * Main encoding and decoding functions
       decode
     , decode'
     , eitherDecode
@@ -49,14 +55,23 @@ module Data.Aeson
     , eitherDecodeFileStrict
     , eitherDecodeStrict'
     , eitherDecodeFileStrict'
+    -- ** Variants for strict text
+    , decodeStrictText
+    , eitherDecodeStrictText
+    -- ** Exception throwing variants
+    , AesonException (..)
+    , throwDecode
+    , throwDecodeStrict
+    , throwDecodeStrictText
+    , throwDecode'
+    , throwDecodeStrict'
     -- * Core JSON types
     , Value(..)
-    , ErrorResp(..)
-    , ErrorType(..)
     , Encoding
     , fromEncoding
     , Array
     , Object
+    , Key
     -- * Convenience types
     , DotNetTime(..)
     -- * Type conversion
@@ -65,6 +80,7 @@ module Data.Aeson
     , fromJSON
     , ToJSON(..)
     , KeyValue(..)
+    , KeyValueOmit(..)
     , (<?>)
     , JSONPath (..)
     -- ** Keys for maps
@@ -80,14 +96,18 @@ module Data.Aeson
     -- ** Liftings to unary and binary type constructors
     , FromJSON1(..)
     , parseJSON1
+    , omittedField1
     , FromJSON2(..)
     , parseJSON2
+    , omittedField2
     , ToJSON1(..)
     , toJSON1
     , toEncoding1
+    , omitField1
     , ToJSON2(..)
     , toJSON2
     , toEncoding2
+    , omitField2
     -- ** Generic JSON classes and options
     , GFromJSON
     , FromArgs
@@ -97,7 +117,6 @@ module Data.Aeson
     , ToArgs
     , Zero
     , One
-    , getFieldName
     , genericToJSON
     , genericLiftToJSON
     , genericToEncoding
@@ -113,6 +132,7 @@ module Data.Aeson
     , constructorTagModifier
     , allNullaryToStringTag
     , omitNothingFields
+    , allowOmittedFields
     , sumEncoding
     , unwrapUnaryRecords
     , tagSingleConstructors
@@ -141,22 +161,24 @@ module Data.Aeson
     , (.:?)
     , (.:!)
     , (.!=)
+    , (.:?=)
+    , (.:!=)
     , object
     -- * Parsing
-    , json
-    , json'
     , parseIndexedJSON
     ) where
 
-import Prelude.Compat
-
-import Data.Aeson.Types.FromJSON (ifromJSON, parseIndexedJSON)
+import Control.Monad.Catch (MonadThrow (..))
+import Data.Aeson.Types.FromJSON (parseIndexedJSON)
 import Data.Aeson.Encoding (encodingToLazyByteString)
-import Data.Aeson.Parser.Internal (decodeWith, decodeStrictWith, eitherDecodeWith, eitherDecodeStrictWith, jsonEOF, json, jsonEOF', json', addFieldNameToErrorResp)
 import Data.Aeson.Types
-import Data.Aeson.Types.Internal (IResult(..), ErrorResp(..) , ErrorType(..), getFieldName)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
+import Data.Aeson.Decoding (decode, eitherDecode, throwDecode, decodeStrict, eitherDecodeStrict, throwDecodeStrict)
+import Data.Aeson.Decoding (decodeStrictText, eitherDecodeStrictText, throwDecodeStrictText)
+
+-- $setup
+-- >>> :set -XOverloadedStrings
 
 -- | Efficiently serialize a JSON value as a lazy 'L.ByteString'.
 --
@@ -167,32 +189,6 @@ encode = encodingToLazyByteString . toEncoding
 -- | Efficiently serialize a JSON value as a lazy 'L.ByteString' and write it to a file.
 encodeFile :: (ToJSON a) => FilePath -> a -> IO ()
 encodeFile fp = L.writeFile fp . encode
-
--- | Efficiently deserialize a JSON value from a lazy 'L.ByteString'.
--- If this fails due to incomplete or invalid input, 'Nothing' is
--- returned.
---
--- The input must consist solely of a JSON document, with no trailing
--- data except for whitespace.
---
--- This function parses immediately, but defers conversion.  See
--- 'json' for details.
-decode :: (FromJSON a) => L.ByteString -> Maybe a
-decode = decodeWith jsonEOF fromJSON
-{-# INLINE decode #-}
-
--- | Efficiently deserialize a JSON value from a strict 'B.ByteString'.
--- If this fails due to incomplete or invalid input, 'Nothing' is
--- returned.
---
--- The input must consist solely of a JSON document, with no trailing
--- data except for whitespace.
---
--- This function parses immediately, but defers conversion.  See
--- 'json' for details.
-decodeStrict :: (FromJSON a) => B.ByteString -> Maybe a
-decodeStrict = decodeStrictWith jsonEOF fromJSON
-{-# INLINE decodeStrict #-}
 
 -- | Efficiently deserialize a JSON value from a file.
 -- If this fails due to incomplete or invalid input, 'Nothing' is
@@ -210,54 +206,30 @@ decodeFileStrict = fmap decodeStrict . B.readFile
 -- If this fails due to incomplete or invalid input, 'Nothing' is
 -- returned.
 --
--- The input must consist solely of a JSON document, with no trailing
--- data except for whitespace.
+-- Since @2.2.0.0@ an alias for 'decode'.
 --
--- This function parses and performs conversion immediately.  See
--- 'json'' for details.
 decode' :: (FromJSON a) => L.ByteString -> Maybe a
-decode' = decodeWith jsonEOF' fromJSON
+decode' = decode
 {-# INLINE decode' #-}
 
 -- | Efficiently deserialize a JSON value from a strict 'B.ByteString'.
 -- If this fails due to incomplete or invalid input, 'Nothing' is
 -- returned.
 --
--- The input must consist solely of a JSON document, with no trailing
--- data except for whitespace.
+-- Since @2.2.0.0@ an alias for 'decodeStrict'.
 --
--- This function parses and performs conversion immediately.  See
--- 'json'' for details.
 decodeStrict' :: (FromJSON a) => B.ByteString -> Maybe a
-decodeStrict' = decodeStrictWith jsonEOF' fromJSON
+decodeStrict' = decodeStrict
 {-# INLINE decodeStrict' #-}
 
 -- | Efficiently deserialize a JSON value from a file.
 -- If this fails due to incomplete or invalid input, 'Nothing' is
 -- returned.
 --
--- The input file's content must consist solely of a JSON document,
--- with no trailing data except for whitespace.
+-- Since @2.2.0.0@ an alias for 'decodeFileStrict'.
 --
--- This function parses and performs conversion immediately.  See
--- 'json'' for details.
 decodeFileStrict' :: (FromJSON a) => FilePath -> IO (Maybe a)
-decodeFileStrict' = fmap decodeStrict' . B.readFile
-
-eitherFormatError :: Either (JSONPath, String) a -> Either String a
-eitherFormatError = either (Left . uncurry addFieldNameToErrorResp) Right
-{-# INLINE eitherFormatError #-}
-
--- | Like 'decode' but returns an error message when decoding fails.
-eitherDecode :: (FromJSON a) => L.ByteString -> Either String a
-eitherDecode = eitherFormatError . eitherDecodeWith jsonEOF ifromJSON
-{-# INLINE eitherDecode #-}
-
--- | Like 'decodeStrict' but returns an error message when decoding fails.
-eitherDecodeStrict :: (FromJSON a) => B.ByteString -> Either String a
-eitherDecodeStrict =
-  eitherFormatError . eitherDecodeStrictWith jsonEOF ifromJSON
-{-# INLINE eitherDecodeStrict #-}
+decodeFileStrict' = decodeFileStrict
 
 -- | Like 'decodeFileStrict' but returns an error message when decoding fails.
 eitherDecodeFileStrict :: (FromJSON a) => FilePath -> IO (Either String a)
@@ -266,21 +238,45 @@ eitherDecodeFileStrict =
 {-# INLINE eitherDecodeFileStrict #-}
 
 -- | Like 'decode'' but returns an error message when decoding fails.
+--
+-- Since @2.2.0.0@ an alias for 'eitherDecode'.
 eitherDecode' :: (FromJSON a) => L.ByteString -> Either String a
-eitherDecode' = eitherFormatError . eitherDecodeWith jsonEOF' ifromJSON
+eitherDecode' = eitherDecode
 {-# INLINE eitherDecode' #-}
 
 -- | Like 'decodeStrict'' but returns an error message when decoding fails.
+--
+-- Since @2.2.0.0@ an alias for 'eitherDecodeStrict'.
 eitherDecodeStrict' :: (FromJSON a) => B.ByteString -> Either String a
-eitherDecodeStrict' =
-  eitherFormatError . eitherDecodeStrictWith jsonEOF' ifromJSON
+eitherDecodeStrict' = eitherDecodeStrict
 {-# INLINE eitherDecodeStrict' #-}
 
 -- | Like 'decodeFileStrict'' but returns an error message when decoding fails.
+--
+-- Since @2.2.0.0@ an alias for 'eitherDecodeFileStrict''.
 eitherDecodeFileStrict' :: (FromJSON a) => FilePath -> IO (Either String a)
-eitherDecodeFileStrict' =
-  fmap eitherDecodeStrict' . B.readFile
+eitherDecodeFileStrict' = eitherDecodeFileStrict
 {-# INLINE eitherDecodeFileStrict' #-}
+
+-- | Like 'decode'' but throws an 'AesonException' when decoding fails.
+--
+-- Since @2.2.0.0@ an alias for 'throwDecode'.
+--
+-- @since 2.1.2.0
+--
+throwDecode' :: forall a m. (FromJSON a, MonadThrow m) => L.ByteString -> m a
+throwDecode' = throwDecode
+{-# INLINE throwDecode' #-}
+
+-- | Like 'decodeStrict'' but throws an 'AesonException' when decoding fails.
+--
+-- Since @2.2.0.0@ an alias for 'throwDecodeStrict'.
+--
+-- @since 2.1.2.0
+--
+throwDecodeStrict' :: forall a m. (FromJSON a, MonadThrow m) => B.ByteString -> m a
+throwDecodeStrict' = throwDecodeStrict
+{-# INLINE throwDecodeStrict' #-}
 
 -- $use
 --
@@ -290,7 +286,7 @@ eitherDecodeFileStrict' =
 --
 -- The most common way to use the library is to define a data type,
 -- corresponding to some JSON data you want to work with, and then
--- write either a 'FromJSON' instance, a to 'ToJSON' instance, or both
+-- write either a 'FromJSON' instance, a 'ToJSON' instance, or both
 -- for that type.
 --
 -- For example, given this JSON data:
@@ -530,3 +526,36 @@ eitherDecodeFileStrict' =
 -- > > import Data.Sequence as Seq
 -- > > encode (Seq.fromList [1,2,3])
 -- > "[1,2,3]"
+
+-- $time
+--
+-- This module contains instances of 'ToJSON' and 'FromJSON' for types from
+-- the <https://hackage.haskell.org/package/time time> library.
+--
+-- Those instances encode time as JSON strings in
+-- <https://en.wikipedia.org/wiki/ISO_8601 ISO 8601> formats, with the
+-- following general form for 'Data.Time.Clock.UTCTime' and
+-- 'Data.Time.LocalTime.ZonedTime', while other time types use subsets of those
+-- fields:
+--
+-- > [+,-]YYYY-MM-DDThh:mm[:ss[.sss]]Z
+--
+-- where
+--
+-- - @[+,-]@ is an optional sign, @+@ or @-@.
+-- - @YYYY@ is the year, which must have at least 4 digits to prevent Y2K problems.
+--   Years from @0000@ to @0999@ must thus be zero-padded.
+-- - @MM@ is a two-digit month.
+-- - @DD@ is a two-digit day.
+-- - @T@ is a literal @\'T\'@ character separating the date and the time of
+--   day. It may be a space instead.
+-- - @hh@ is a two-digit hour.
+-- - @mm@ is a two-digit minute.
+-- - @ss@ is a two-digit second.
+-- - @sss@ is a decimal fraction of a second; it may have any nonzero number of digits.
+-- - @Z@ is a time zone; it may be preceded by an optional space.
+--
+-- For more information, see <https://en.wikipedia.org/wiki/ISO_8601 ISO 8601>
+-- <https://hackage.haskell.org/package/time time>,
+-- and <https://hackage.haskell.org/package/attoparsec-iso8601 attoparsec-iso8601>
+-- (where the relevant parsers are defined).
